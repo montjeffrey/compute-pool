@@ -196,7 +196,13 @@ func TestRunUsesFreshScratchDirAndRemovesIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rel, err := filepath.Rel(h.workDir, dir)
+	// Resolve links first: on macOS the temp dir is under /var, a link to
+	// /private/var, and the job reports the resolved path.
+	realWork, err := filepath.EvalSymlinks(h.workDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel, err := filepath.Rel(realWork, dir)
 	if err != nil || strings.HasPrefix(rel, "..") || rel == "." {
 		t.Fatalf("job ran in %q, want a subdirectory of %q", dir, h.workDir)
 	}

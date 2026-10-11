@@ -39,9 +39,8 @@ jobs:
   vulncheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      # The Go team's action installs a govulncheck that understands the
+      # current Go release; an old pinned binary can't parse newer code.
+      - uses: golang/govulncheck-action@v1
         with:
-          go-version: stable
-      - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+          go-version-input: stable
