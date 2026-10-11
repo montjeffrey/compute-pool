@@ -1,0 +1,587 @@
+package agent_test
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/montjeffrey/compute-pool/internal/agent"
+	"github.com/montjeffrey/compute-pool/internal/client"
+	"github.com/montjeffrey/compute-pool/internal/proto"
+	"github.com/montjeffrey/compute-pool/internal/sysinfo"
+)
+
+// TestHelperProcess is not a real test: the agent runs this test binary as
+// the "remote" program, choosing behavior with the argument after "--".
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	args := os.Args
+	for len(args) > 0 && args[0] != "--" {
+		args = args[1:]
+	}
+	if len(args) < 2 {
+		os.Exit(2)
+	}
+	switch args[1] {
+	case "echo":
+		fmt.Fprint(os.Stdout, "hello from job\n")
+		fmt.Fprint(os.Stderr, "warning from job\n")
+		os.Exit(3)
+	case "env":
+		fmt.Printf("%v|%s|%s\n", os.Getenv("POOL_JOB_ID") != "", os.Getenv("POOL_NODE"), os.Getenv("FOO"))
+	case "pwd":
+		wd, _ := os.Getwd()
+		fmt.Print(wd)
+	case "files":
+		in, err := os.ReadFile(filepath.Join("data", "in.txt"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		_ = os.MkdirAll(filepath.Join("out", "sub"), 0o755)
+		_ = os.WriteFile(filepath.Join("out", "result.txt"), bytes.ToUpper(in), 0o644)
+		_ = os.WriteFile(filepath.Join("out", "sub", "nested.txt"), []byte("nested"), 0o644)
+		_ = os.WriteFile(filepath.Join("out", "empty.txt"), nil, 0o644)
+		_ = os.WriteFile("not-collected.txt", []byte("x"), 0o644)
+	case "sleep":
+		time.Sleep(time.Minute)
+	case "spawn":
+		// Start a grandchild, then wait; canceling the job must kill both.
+		child := exec.Command(os.Args[0], "-test.run=TestHelperProcess", "--", "heartbeat")
+		child.Env = os.Environ()
+		if err := child.Start(); err != nil {
+			os.Exit(1)
+		}
+		fmt.Println("spawned")
+		time.Sleep(time.Minute)
+	case "heartbeat":
+		deadline := time.Now().Add(30 * time.Second) // never outlive a broken test for long
+		for i := 0; time.Now().Before(deadline); i++ {
+			_ = os.WriteFile(os.Getenv("HEARTBEAT_FILE"), []byte(strconv.Itoa(i)), 0o600)
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	os.Exit(0)
+}
+
+type allowAll struct{}
+
+func (allowAll) Authorize(context.Context, string) (agent.Identity, error) {
+	return agent.Identity{Node: "tester", Login: "tester@example"}, nil
+}
+
+type denyAll struct{}
+
+func (denyAll) Authorize(context.Context, string) (agent.Identity, error) {
+	return agent.Identity{}, agent.ErrForbidden
+}
+
+type harness struct {
+	agent    *agent.Agent
+	client   *client.Client
+	host     string
+	workDir  string
+	outDir   string // where the client writes collected files
+	cacheDir string
+}
+
+func newHarness(t *testing.T, maxJobs int, auth agent.Authorizer) *harness {
+	return newHarnessWith(t, maxJobs, auth, nil)
+}
+
+func newHarnessWith(t *testing.T, maxJobs int, auth agent.Authorizer, tweak func(*agent.Config)) *harness {
+	t.Helper()
+	workDir := t.TempDir()
+	cacheDir := t.TempDir()
+	cfg := agent.Config{
+		NodeName: "test-node",
+		MaxJobs:  maxJobs,
+		WorkDir:  workDir,
+		Auth:     auth,
+		Logger:   log.New(io.Discard, "", 0),
+		CacheDir: cacheDir,
+	}
+	if tweak != nil {
+		tweak(&cfg)
+	}
+	a, err := agent.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(a.Handler())
+	t.Cleanup(srv.Close)
+	host, port, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	c := client.New()
+	c.Port, _ = strconv.Atoi(port)
+	return &harness{agent: a, client: c, host: host, workDir: workDir, outDir: t.TempDir(), cacheDir: cacheDir}
+}
+
+func helperRequest(t *testing.T, mode string, env map[string]string) proto.RunRequest {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := map[string]string{"GO_WANT_HELPER_PROCESS": "1"}
+	for k, v := range env {
+		all[k] = v
+	}
+	return proto.RunRequest{Argv: []string{exe, "-test.run=TestHelperProcess", "--", mode}, Env: all}
+}
+
+func (h *harness) run(t *testing.T, ctx context.Context, req proto.RunRequest) (client.Result, string, string, error) {
+	t.Helper()
+	var out, errb bytes.Buffer
+	res, err := h.client.Run(ctx, h.host, req, client.Output{Stdout: &out, Stderr: &errb, Dir: h.outDir})
+	return res, out.String(), errb.String(), err
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestRunStreamsOutputAndExitCode(t *testing.T) {
+	h := newHarness(t, 2, allowAll{})
+	res, out, errOut, err := h.run(t, context.Background(), helperRequest(t, "echo", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "hello from job\n" || errOut != "warning from job\n" {
+		t.Errorf("stdout=%q stderr=%q", out, errOut)
+	}
+	if res.ExitCode != 3 || res.Node != "test-node" || res.JobID == "" || res.RemoteError != "" {
+		t.Errorf("result = %+v", res)
+	}
+}
+
+func TestRunSetsEnvironment(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	req := helperRequest(t, "env", map[string]string{"FOO": "bar", "POOL_NODE": "spoofed"})
+	_, out, _, err := h.run(t, context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out) != "true|test-node|bar" {
+		t.Errorf("env output = %q, want true|test-node|bar", out)
+	}
+}
+
+func TestRunUsesFreshScratchDirAndRemovesIt(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	_, dir, _, err := h.run(t, context.Background(), helperRequest(t, "pwd", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel, err := filepath.Rel(h.workDir, dir)
+	if err != nil || strings.HasPrefix(rel, "..") || rel == "." {
+		t.Fatalf("job ran in %q, want a subdirectory of %q", dir, h.workDir)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("scratch dir %q still exists after the job (err=%v)", dir, err)
+	}
+}
+
+func TestRunShell(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	// "&&" means the same thing in cmd.exe and /bin/sh.
+	req := proto.RunRequest{Argv: []string{"echo", "first", "&&", "echo", "second"}, Shell: true}
+	res, out, _, err := h.run(t, context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 0 || !strings.Contains(out, "first") || !strings.Contains(out, "second") {
+		t.Errorf("exit=%d out=%q", res.ExitCode, out)
+	}
+}
+
+func TestRunMissingProgram(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	res, _, _, err := h.run(t, context.Background(), proto.RunRequest{Argv: []string{"no-such-program-7f3a"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 127 || !strings.Contains(res.RemoteError, "no-such-program-7f3a") {
+		t.Errorf("result = %+v", res)
+	}
+}
+
+func TestRunTimeout(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	req := helperRequest(t, "sleep", nil)
+	req.TimeoutSec = 1
+	start := time.Now()
+	res, _, _, err := h.run(t, context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 124 || !strings.Contains(res.RemoteError, "timed out") {
+		t.Errorf("result = %+v", res)
+	}
+	if took := time.Since(start); took > 15*time.Second {
+		t.Errorf("timeout took %s", took)
+	}
+}
+
+func TestCancelKillsWholeProcessTree(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	beat := filepath.Join(t.TempDir(), "heartbeat")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, err := h.run(t, ctx, helperRequest(t, "spawn", map[string]string{"HEARTBEAT_FILE": beat}))
+		done <- err
+	}()
+	waitFor(t, "grandchild heartbeat", func() bool { _, err := os.Stat(beat); return err == nil })
+
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Errorf("Run after cancel: err = %v, want context.Canceled", err)
+	}
+	waitFor(t, "agent to finish the job", func() bool { return h.agent.Running() == 0 })
+
+	// If the grandchild survived, it keeps rewriting the file.
+	time.Sleep(300 * time.Millisecond)
+	before, _ := os.ReadFile(beat)
+	time.Sleep(500 * time.Millisecond)
+	after, _ := os.ReadFile(beat)
+	if !bytes.Equal(before, after) {
+		t.Errorf("grandchild still running after cancel (heartbeat %s -> %s)", before, after)
+	}
+}
+
+func TestBusyAgentRejectsExtraJobs(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _, _, _, _ = h.run(t, ctx, helperRequest(t, "sleep", nil)) }()
+	waitFor(t, "first job to start", func() bool { return h.agent.Running() == 1 })
+
+	_, _, _, err := h.run(t, context.Background(), helperRequest(t, "echo", nil))
+	if !errors.Is(err, client.ErrBusy) {
+		t.Errorf("second job: err = %v, want ErrBusy", err)
+	}
+	info, err := h.client.Info(context.Background(), h.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Running != 1 || info.MaxJobs != 1 || info.Node != "test-node" || info.Version != proto.Version {
+		t.Errorf("info = %+v", info)
+	}
+	cancel()
+	waitFor(t, "first job to stop", func() bool { return h.agent.Running() == 0 })
+}
+
+func TestForbiddenCaller(t *testing.T) {
+	h := newHarness(t, 1, denyAll{})
+	if _, err := h.client.Info(context.Background(), h.host); !errors.Is(err, client.ErrForbidden) {
+		t.Errorf("Info: err = %v, want ErrForbidden", err)
+	}
+	_, _, _, err := h.run(t, context.Background(), proto.RunRequest{Argv: []string{"whoami"}})
+	if !errors.Is(err, client.ErrForbidden) {
+		t.Errorf("Run: err = %v, want ErrForbidden", err)
+	}
+}
+
+func TestShipAndCollectFiles(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	req := helperRequest(t, "files", nil)
+	req.Files = []proto.InputFile{{Path: "data/in.txt", Data: []byte("hello pool")}}
+	req.Collect = []string{"out"}
+	res, _, errOut, err := h.run(t, context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 0 || res.RemoteError != "" {
+		t.Fatalf("result = %+v, stderr = %q", res, errOut)
+	}
+	want := map[string]string{
+		"out/result.txt":     "HELLO POOL",
+		"out/sub/nested.txt": "nested",
+		"out/empty.txt":      "",
+	}
+	if len(res.Files) != len(want) {
+		t.Errorf("collected %v, want %d files", res.Files, len(want))
+	}
+	for rel, content := range want {
+		got, err := os.ReadFile(filepath.Join(h.outDir, filepath.FromSlash(rel)))
+		if err != nil || string(got) != content {
+			t.Errorf("%s = %q, %v; want %q", rel, got, err, content)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(h.outDir, "not-collected.txt")); !os.IsNotExist(err) {
+		t.Error("a file outside the collect patterns came back")
+	}
+}
+
+func TestCollectReportsUnmatchedPatterns(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	req := helperRequest(t, "pwd", nil)
+	req.Collect = []string{"*.csv"}
+	res, _, _, err := h.run(t, context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 0 || !strings.Contains(res.RemoteError, "nothing matched *.csv") {
+		t.Errorf("result = %+v", res)
+	}
+}
+
+func TestShippedProgramRunsByName(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "helper"
+	if filepath.Ext(exe) == ".exe" {
+		name += ".exe"
+	}
+	h := newHarness(t, 1, allowAll{})
+	req := proto.RunRequest{
+		// The bare name would fail a PATH lookup; the agent must use the shipped copy.
+		Argv:  []string{strings.TrimSuffix(name, ".exe"), "-test.run=TestHelperProcess", "--", "echo"},
+		Env:   map[string]string{"GO_WANT_HELPER_PROCESS": "1"},
+		Files: []proto.InputFile{{Path: name, Data: data}},
+	}
+	res, out, _, err := h.run(t, context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 3 || out != "hello from job\n" {
+		t.Errorf("result = %+v, stdout = %q", res, out)
+	}
+}
+
+func sha(data []byte) string {
+	s := sha256.Sum256(data)
+	return hex.EncodeToString(s[:])
+}
+
+func TestFileCache(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	content := []byte("cached input")
+	hash := sha(content)
+	req := helperRequest(t, "files", nil)
+	req.Files = []proto.InputFile{{Path: "data/in.txt", Data: content, SHA256: hash}}
+	req.Collect = []string{"out/result.txt"}
+
+	run := func(label string) string {
+		t.Helper()
+		res, _, errOut, err := h.run(t, context.Background(), req)
+		if err != nil || res.ExitCode != 0 {
+			t.Fatalf("%s: res=%+v err=%v stderr=%q", label, res, err, errOut)
+		}
+		got, _ := os.ReadFile(filepath.Join(h.outDir, "out", "result.txt"))
+		return string(got)
+	}
+	check := func(label string) {
+		t.Helper()
+		if got := run(label); got != "CACHED INPUT" {
+			t.Fatalf("%s: result = %q", label, got)
+		}
+	}
+
+	check("first run sends the data")
+	entry := filepath.Join(h.cacheDir, hash)
+	if _, err := os.Stat(entry); err != nil {
+		t.Fatalf("file not cached: %v", err)
+	}
+	// Prove the second run reads the agent's copy rather than resent data:
+	// mark the cached copy and see the mark in the job's output.
+	if err := os.WriteFile(entry, []byte("from cache"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := run("second run"); got != "FROM CACHE" {
+		t.Fatalf("second run did not use the cache: result = %q", got)
+	}
+	if err := os.WriteFile(entry, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	check("second run uses the cache")
+
+	// The agent loses its copy; the client must notice and resend.
+	if err := os.Remove(filepath.Join(h.cacheDir, hash)); err != nil {
+		t.Fatal(err)
+	}
+	check("run after cache loss")
+}
+
+func TestFileCacheRejectsWrongHash(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	req := helperRequest(t, "pwd", nil)
+	req.Files = []proto.InputFile{{Path: "x.bin", Data: []byte("real"), SHA256: sha([]byte("forged"))}}
+	res, _, _, err := h.run(t, context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 127 || !strings.Contains(res.RemoteError, "does not match") {
+		t.Errorf("result = %+v", res)
+	}
+	if entries, _ := os.ReadDir(h.cacheDir); len(entries) != 0 {
+		t.Errorf("cache holds %d entries after a forged upload", len(entries))
+	}
+}
+
+func TestUnsafePathsRejected(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	for _, p := range []string{"../escape.txt", "/etc/passwd", `C:\Windows\x`, "a/../../b"} {
+		req := helperRequest(t, "pwd", nil)
+		req.Files = []proto.InputFile{{Path: p, Data: []byte("x")}}
+		res, _, _, err := h.run(t, context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.ExitCode != 127 || !strings.Contains(res.RemoteError, "unsafe path") {
+			t.Errorf("input %q: result = %+v", p, res)
+		}
+	}
+	req := helperRequest(t, "pwd", nil)
+	req.Collect = []string{"../*"}
+	res, _, _, err := h.run(t, context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.RemoteError, "unsafe path") {
+		t.Errorf("collect ../*: result = %+v", res)
+	}
+}
+
+func TestJobHistory(t *testing.T) {
+	h := newHarness(t, 2, allowAll{})
+	if _, _, _, err := h.run(t, context.Background(), helperRequest(t, "echo", nil)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _, _, _, _ = h.run(t, ctx, helperRequest(t, "sleep", nil)) }()
+	waitFor(t, "sleep job to start", func() bool { return h.agent.Running() == 1 })
+
+	jobs, err := h.client.Jobs(context.Background(), h.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Running) != 1 || !jobs.Running[0].Running || !strings.Contains(jobs.Running[0].Command, "sleep") {
+		t.Errorf("running = %+v", jobs.Running)
+	}
+	if len(jobs.Recent) != 1 {
+		t.Fatalf("recent = %+v", jobs.Recent)
+	}
+	r := jobs.Recent[0]
+	if r.ExitCode != 3 || r.From != "tester" || r.Running || !strings.Contains(r.Command, "echo") || r.Started.IsZero() {
+		t.Errorf("recent[0] = %+v", r)
+	}
+
+	cancel()
+	waitFor(t, "sleep job to stop", func() bool { return h.agent.Running() == 0 })
+	jobs = h.agent.Jobs()
+	if len(jobs.Running) != 0 || len(jobs.Recent) != 2 || jobs.Recent[0].ExitCode != 130 {
+		t.Errorf("after cancel: %+v", jobs)
+	}
+}
+
+// fixedProbe reports a constant snapshot that a test can change.
+type fixedProbe struct{ snap sysinfo.Snapshot }
+
+func (p *fixedProbe) get() sysinfo.Snapshot { return p.snap }
+
+func TestBatteryPolicy(t *testing.T) {
+	probe := &fixedProbe{sysinfo.Snapshot{CPUBusyPct: 10, Power: sysinfo.Power{Known: true, HasBattery: true, OnBattery: true, BatteryPct: 55}}}
+	h := newHarnessWith(t, 2, allowAll{}, func(c *agent.Config) { c.Probe = probe.get; c.BusyThreshold = 80 })
+
+	info, err := h.client.Info(context.Background(), h.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Accepting || info.Reason != "on battery" || !info.OnBattery || info.BatteryPct != 55 {
+		t.Errorf("info on battery = %+v", info)
+	}
+	_, _, _, err = h.run(t, context.Background(), helperRequest(t, "echo", nil))
+	if !errors.Is(err, client.ErrBusy) || !strings.Contains(err.Error(), "on battery") {
+		t.Errorf("run on battery: err = %v, want ErrBusy mentioning battery", err)
+	}
+
+	probe.snap.Power.OnBattery = false // plugged back in
+	if res, _, _, err := h.run(t, context.Background(), helperRequest(t, "echo", nil)); err != nil || res.ExitCode != 3 {
+		t.Errorf("run on AC: res=%+v err=%v", res, err)
+	}
+}
+
+func TestLendOnBattery(t *testing.T) {
+	probe := &fixedProbe{sysinfo.Snapshot{CPUBusyPct: -1, Power: sysinfo.Power{Known: true, HasBattery: true, OnBattery: true}}}
+	h := newHarnessWith(t, 1, allowAll{}, func(c *agent.Config) { c.Probe = probe.get; c.LendOnBattery = true })
+	if res, _, _, err := h.run(t, context.Background(), helperRequest(t, "echo", nil)); err != nil || res.ExitCode != 3 {
+		t.Errorf("res=%+v err=%v", res, err)
+	}
+}
+
+func TestBusyThreshold(t *testing.T) {
+	probe := &fixedProbe{sysinfo.Snapshot{CPUBusyPct: 92, Power: sysinfo.Power{BatteryPct: -1}}}
+	h := newHarnessWith(t, 4, allowAll{}, func(c *agent.Config) { c.Probe = probe.get; c.BusyThreshold = 80 })
+
+	info, err := h.client.Info(context.Background(), h.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Accepting || !strings.Contains(info.Reason, "cpu busy (92%)") {
+		t.Errorf("info = %+v", info)
+	}
+	if want := float64(info.LogicalCPUs) * 0.08; info.IdleCPUs < want-0.01 || info.IdleCPUs > want+0.01 {
+		t.Errorf("IdleCPUs = %v, want %v", info.IdleCPUs, want)
+	}
+	if _, _, _, err := h.run(t, context.Background(), helperRequest(t, "echo", nil)); !errors.Is(err, client.ErrBusy) {
+		t.Errorf("run while busy: err = %v, want ErrBusy", err)
+	}
+
+	probe.snap.CPUBusyPct = 30
+	info, _ = h.client.Info(context.Background(), h.host)
+	if !info.Accepting || info.Reason != "" {
+		t.Errorf("info after load dropped = %+v", info)
+	}
+}
+
+func TestInfoWithoutProbeIsAcceptingAndUnknown(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	info, err := h.client.Info(context.Background(), h.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Accepting || info.CPUBusyPct != -1 || info.IdleCPUs != float64(info.LogicalCPUs) || info.BatteryPct != -1 {
+		t.Errorf("info = %+v", info)
+	}
+}
+
+func TestEmptyCommandRejected(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	_, _, _, err := h.run(t, context.Background(), proto.RunRequest{})
+	if err == nil || !strings.Contains(err.Error(), "400") {
+		t.Errorf("err = %v, want a 400 error", err)
+	}
+}

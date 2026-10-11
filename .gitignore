@@ -1,0 +1,6 @@
+/bin/
+/dist/
+/pool-out/
+*.exe
+*.test
+*.out
