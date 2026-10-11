@@ -1,11 +1,11 @@
 # Measures pool speedup: the same CPU-bound tasks on one device vs all devices.
 #
 #   go build -o bin/pool.exe ./cmd/pool; go build -o bin/poolbench.exe ./cmd/poolbench
-#   pwsh scripts/bench.ps1 [-Tasks 48] [-Work 8000000] [-Solo desktop-jmc] [-Repeat 2]
+#   pwsh scripts/bench.ps1 [-Tasks 48] [-Work 8000000] [-Solo <device>] [-Repeat 2]
 param(
     [int]$Tasks = 48,
     [int]$Work = 8000000,
-    [string]$Solo = "desktop-jmc",
+    [string]$Solo = $env:COMPUTERNAME.ToLower(),  # this device's tailnet name, usually
     [int]$Repeat = 2
 )
 $ErrorActionPreference = "Stop"

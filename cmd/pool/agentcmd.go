@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/montjeffrey/compute-pool/internal/agent"
@@ -64,7 +65,7 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 	}
 	logOut := stderr
 	if *f.logFile != "" {
-		lf, err := openLogFile(*f.logFile)
+		lf, err := newRotatingLog(*f.logFile)
 		if err != nil {
 			return err
 		}
@@ -91,6 +92,11 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 		if err != nil {
 			logger.Printf("agent stopped")
 			return nil
+		}
+		if st.SelfTagged {
+			// On a tagged device the "owner" is the shared pseudo-user for all
+			// tagged devices, so the same-owner check would admit every one.
+			return errors.New("refusing to run on a tagged Tailscale device: the agent must run on a device owned by a person")
 		}
 		if a == nil {
 			allowed := append([]string{st.Self.Name}, strings.Split(*f.allow, ",")...)
@@ -124,7 +130,10 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 			// defense.
 			boundIP = st.Self.IPv4
 			addr = net.JoinHostPort(boundIP, strconv.Itoa(*f.port))
+		} else {
+			logger.Printf("warning: --listen %s may expose the agent beyond Tailscale; only the identity check protects it", addr)
 		}
+		a.SetAllowedHosts(agentHosts(addr, st.Self))
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
 			logger.Printf("listen on %s: %v; retrying in 10s", addr, err)
@@ -143,6 +152,22 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 		logger.Printf("listener stopped (%v); binding again", err)
 		sleepCtx(ctx, 2*time.Second)
 	}
+}
+
+// agentHosts lists the Host headers clients legitimately send: the listen
+// address and this device's Tailscale IP and names on the same port.
+func agentHosts(addr string, self tsutil.Peer) []string {
+	hosts := []string{addr}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return hosts
+	}
+	for _, h := range []string{self.IPv4, self.DNSName, self.Name} {
+		if h != "" {
+			hosts = append(hosts, net.JoinHostPort(h, port))
+		}
+	}
+	return hosts
 }
 
 func waitForTailscale(ctx context.Context, logger *log.Logger) (tsutil.Status, error) {
@@ -170,7 +195,7 @@ func waitForTailscale(ctx context.Context, logger *log.Logger) (tsutil.Status, e
 // fail. Sleep, network changes and Tailscale restarts can leave a listener
 // bound to an address that no longer works without any error surfacing.
 func serveUntilBroken(ctx context.Context, h http.Handler, ln net.Listener, boundIP string, logger *log.Logger) error {
-	srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second}
+	srv := newServer(h)
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
 	tick := time.NewTicker(30 * time.Second)
@@ -221,6 +246,17 @@ func checkListener(ctx context.Context, addr, boundIP string) string {
 	return ""
 }
 
+// newServer applies the limits shared by the agent and the dashboard. There
+// is no WriteTimeout because job output streams for as long as a job runs.
+func newServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
+	}
+}
+
 const maxLogBytes = 10 << 20
 
 // openLogFile opens path for appending, first moving it to path.1 if it has
@@ -234,6 +270,52 @@ func openLogFile(path string) (*os.File, error) {
 		_ = os.Rename(path, path+".1")
 	}
 	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+}
+
+// rotatingLog is a log file that moves itself to path.1 whenever it passes
+// maxLogBytes, so a long-running agent's log stays bounded.
+type rotatingLog struct {
+	path string
+	mu   sync.Mutex
+	f    *os.File
+	size int64
+}
+
+func newRotatingLog(path string) (*rotatingLog, error) {
+	f, err := openLogFile(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return &rotatingLog{path: path, f: f, size: info.Size()}, nil
+}
+
+func (l *rotatingLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.size+int64(len(p)) > maxLogBytes {
+		l.f.Close()
+		_ = os.Remove(l.path + ".1")
+		_ = os.Rename(l.path, l.path+".1")
+		f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			return 0, err
+		}
+		l.f, l.size = f, 0
+	}
+	n, err := l.f.Write(p)
+	l.size += int64(n)
+	return n, err
+}
+
+func (l *rotatingLog) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.f.Close()
 }
 
 // sleepCtx waits for d and reports false if ctx ended first.

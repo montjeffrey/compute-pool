@@ -234,6 +234,7 @@ func cmdDashboard(ctx context.Context, args []string, stdout, stderr io.Writer) 
 
 	addr := *listen
 	h := d.handler()
+	var self tsutil.Peer
 	if *tailnet {
 		st, err := tsutil.GetStatus(ctx)
 		if err != nil {
@@ -243,6 +244,7 @@ func cmdDashboard(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		if err != nil {
 			return fmt.Errorf("--listen: %w", err)
 		}
+		self = st.Self
 		addr = net.JoinHostPort(st.Self.IPv4, p)
 		allowed := append([]string{st.Self.Name}, strings.Split(*allow, ",")...)
 		h = requireDevice(agent.NewTailnetAuthorizer(st.SelfLogin, allowed), h)
@@ -251,7 +253,11 @@ func cmdDashboard(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if err != nil {
 		return err
 	}
-	if !*tailnet {
+	// Either way, only Host headers naming this server are answered, which
+	// blocks DNS rebinding from a web page.
+	if *tailnet {
+		h = requireHost(agentHosts(ln.Addr().String(), self), h)
+	} else {
 		_, p, _ := net.SplitHostPort(ln.Addr().String())
 		h = requireHost([]string{ln.Addr().String(), "localhost:" + p}, h)
 	}
@@ -260,7 +266,7 @@ func cmdDashboard(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if *open {
 		_ = openBrowser(url)
 	}
-	srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second}
+	srv := newServer(h)
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -84,7 +84,9 @@ func collectOutputs(dir string, patterns []string, fw *proto.FrameWriter) error 
 		if err != nil {
 			return err
 		}
-		matches, err := filepath.Glob(filepath.Join(dir, filepath.FromSlash(rel)))
+		// Match within the job directory itself, so glob characters in the
+		// directory's own path can't change what the pattern selects.
+		matches, err := fs.Glob(os.DirFS(dir), rel)
 		if err != nil {
 			return fmt.Errorf("pattern %q: %w", pat, err)
 		}
@@ -92,7 +94,8 @@ func collectOutputs(dir string, patterns []string, fw *proto.FrameWriter) error 
 			unmatched = append(unmatched, pat)
 		}
 		for _, m := range matches {
-			err := filepath.WalkDir(m, func(p string, d fs.DirEntry, err error) error {
+			full := filepath.Join(dir, filepath.FromSlash(m))
+			err := filepath.WalkDir(full, func(p string, d fs.DirEntry, err error) error {
 				if err != nil {
 					return err
 				}

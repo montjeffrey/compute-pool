@@ -255,16 +255,24 @@ func (c *Client) Run(ctx context.Context, host string, req proto.RunRequest, out
 	}
 }
 
-// fileSink writes collected files under dir. Paths are re-validated here
-// because the client must not trust an agent to keep files inside dir.
+// maxCollectFiles bounds how many files one job may send back.
+const maxCollectFiles = 10000
+
+// fileSink writes collected files under dir. Everything is re-checked here
+// because the client must not trust an agent: paths must stay inside dir,
+// totals are capped, and existing symbolic links are never written through.
+// Agents send each file's chunks back to back, so one file is open at a time.
 type fileSink struct {
-	dir   string
-	open  map[string]*os.File
-	order []string
+	dir     string
+	cur     *os.File
+	curPath string
+	seen    map[string]bool
+	order   []string
+	total   int64
 }
 
 func newFileSink(dir string) *fileSink {
-	return &fileSink{dir: dir, open: make(map[string]*os.File)}
+	return &fileSink{dir: dir, seen: make(map[string]bool)}
 }
 
 func (s *fileSink) write(p string, data []byte) error {
@@ -275,32 +283,48 @@ func (s *fileSink) write(p string, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("agent sent %w", err)
 	}
-	f, ok := s.open[rel]
-	if !ok {
+	if s.total += int64(len(data)); s.total > proto.MaxCollectBytes {
+		return fmt.Errorf("agent sent more than %d MiB of files", proto.MaxCollectBytes>>20)
+	}
+	if rel != s.curPath || s.cur == nil {
+		if s.seen[rel] {
+			return fmt.Errorf("agent sent %s twice", rel)
+		}
+		if len(s.seen) >= maxCollectFiles {
+			return fmt.Errorf("agent sent more than %d files", maxCollectFiles)
+		}
+		if err := s.closeCurrent(); err != nil {
+			return err
+		}
 		dst := filepath.Join(s.dir, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return err
 		}
-		if f, err = os.Create(dst); err != nil {
+		if fi, err := os.Lstat(dst); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to write %s through a symbolic link", dst)
+		}
+		f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
 			return err
 		}
-		s.open[rel] = f
+		s.cur, s.curPath = f, rel
+		s.seen[rel] = true
 		s.order = append(s.order, rel)
 	}
-	_, err = f.Write(data)
+	_, err = s.cur.Write(data)
 	return err
 }
 
-func (s *fileSink) close() error {
-	var first error
-	for rel, f := range s.open {
-		if err := f.Close(); err != nil && first == nil {
-			first = err
-		}
-		delete(s.open, rel)
+func (s *fileSink) closeCurrent() error {
+	if s.cur == nil {
+		return nil
 	}
-	return first
+	err := s.cur.Close()
+	s.cur = nil
+	return err
 }
+
+func (s *fileSink) close() error { return s.closeCurrent() }
 
 func checkStatus(resp *http.Response) error {
 	switch resp.StatusCode {

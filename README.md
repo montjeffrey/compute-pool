@@ -4,15 +4,17 @@ Share CPU between your own devices over Tailscale. Each device runs an agent;
 any allowed device can send it a command and get the output streamed back.
 
 ```
-pool agent --allow desktop-jmc,jm-c     # on each device that lends CPU
-pool nodes                              # load, power and status of every device
-pool run -- go test ./...               # run on the least-loaded device
-pool run --node jm-c -- go test ./...   # or pick the device yourself
+pool agent --allow desktop,laptop        # on each device that lends CPU
+pool nodes                               # load, power and status of every device
+pool run -- go test ./...                # run on the least-loaded device
+pool run --node laptop -- go test ./...  # or pick the device yourself
 pool map --inputs 'data/*.csv' --ship analyze.py --collect out -- python analyze.py {}
-                                        # one task per file, spread over every device
+                                         # one task per file, spread over every device
 ```
 
-Status: **milestone 4 (hardening)**: runs in the background, survives sleep and crashes, live dashboard.
+Status: pre-release. Works on Windows (tested on two machines); Linux and macOS
+build and pass the test suite in CI. See [SECURITY.md](SECURITY.md) before
+running an agent.
 
 ## Splitting work with `pool map`
 
@@ -45,8 +47,12 @@ Choose the items with exactly one of:
   verified against its hash before it is cached.
 
 Paths are checked on both sides: inputs and collected files can't use `..`,
-absolute paths or drive letters, and symbolic links are never collected.
-Limits: about 180 MiB of shipped files and 256 MiB of collected files per task.
+absolute paths, drive letters, Windows device names (`CON`, `NUL`, …) or
+control characters, and a matched symbolic link is skipped rather than
+followed. The client never writes a returned file through an existing link.
+Limits per task: about 180 MiB and 10,000 shipped files; 256 MiB and 10,000
+collected files; 16 MiB of buffered output each for stdout and stderr in
+`pool map`.
 
 ### Measured speedup
 
@@ -55,11 +61,11 @@ on the desktop) on one device and on all devices:
 
 | Setup | 1 device | 2 devices | Speedup |
 |---|---|---|---|
-| desktop (10 slots) + jm-c lending **2** slots, 48 tasks | 11.7s | 12.3s | 0.95× |
-| desktop (10 slots) + jm-c lending **8** slots, 96 tasks | 22.1s | 17.2s | **1.28×** |
+| desktop (10 slots) + laptop lending **2** slots, 48 tasks | 11.7s | 12.3s | 0.95× |
+| desktop (10 slots) + laptop lending **8** slots, 96 tasks | 22.1s | 17.2s | **1.28×** |
 
 The best possible result for the second setup is about 1.41× (desktop ~5.7
-tasks/s, jm-c on battery ~2.4 tasks/s), so the scheduler gets ~90% of it.
+tasks/s, laptop on battery ~2.4 tasks/s), so the scheduler gets ~90% of it.
 Lending only 2 laptop slots adds ~10% capacity, which the desktop's waves of
 10 tasks absorb, so pooling only pays off once a device lends a meaningful
 share of its cores. Pooling also pays off more for longer tasks, since the
@@ -86,9 +92,9 @@ one. If that agent declines in the meantime, the next one is tried. When no
 device can take the job, the error lists why for each device.
 
 ```
-DEVICE                     OS             CPUS  IDLE  LOAD  JOBS  POWER        STATUS
-desktop-jmc (this device)  windows/amd64  20    17.2  14%   0/10  AC           ready
-jm-c                       windows/amd64  16    13.4  16%   0/2   battery 65%  paused: on battery
+DEVICE                 OS             CPUS  IDLE  LOAD  JOBS  POWER        STATUS
+desktop (this device)  windows/amd64  20    17.2  14%   0/10  AC           ready
+laptop                 windows/amd64  16    13.4  16%   0/2   battery 65%  paused: on battery
 ```
 
 Owner activity is judged from total CPU load, not keyboard or mouse input:
@@ -97,26 +103,40 @@ Jobs already running are not paused; they keep below-normal priority.
 
 ## How it stays safe
 
-The agent runs commands from other machines, so access control is the core
-feature:
+An agent runs whatever an allowed device sends it, as the user the agent runs
+as. Deciding who is allowed is therefore the whole job, and it is done in
+layers:
 
-- It listens **only on the device's Tailscale address**, never on LAN or public interfaces.
+- The agent listens **only on the device's Tailscale address**, never on LAN or
+  public interfaces (unless you pass `--listen`, which logs a warning).
 - Every request is identified with `tailscale whois`. A caller must be **owned by
-  the same Tailscale user** *and* be **named in `--allow`**. Anything else gets 403.
+  the same Tailscale user** *and* be **named in `--allow`**. Addresses outside
+  Tailscale's ranges are refused before any lookup. Anything else gets 403.
+- **Web pages can't reach it.** Requests carrying browser headers (`Origin`,
+  cross-site `Sec-Fetch-Site`) are refused, jobs must be sent as JSON (which a
+  page can't do without a preflight the agent never answers), and the Host header
+  must name the agent, which stops DNS rebinding.
+- The client only sends jobs, files and `--env` values to **devices you own**,
+  so a device shared into your tailnet can't pose as an idle agent to receive them.
 - Traffic is encrypted by Tailscale's WireGuard tunnel.
-- Jobs run at **below-normal priority** in a fresh scratch folder (deleted afterwards),
-  with no console window. Canceling (Ctrl+C) or `--timeout` kills the **whole process tree**.
+- Jobs run at **below-normal priority** in a fresh scratch folder (deleted
+  afterwards). Canceling (Ctrl+C) or `--timeout` kills the **whole process tree**.
+
+[SECURITY.md](SECURITY.md) has the full threat model, the known limits, and how
+to report a vulnerability.
 
 ## Build
 
 Requires Go 1.24+ and Tailscale signed in on every device.
 
 ```powershell
-go build -o bin/pool.exe ./cmd/pool
+go build -trimpath -o bin/pool.exe ./cmd/pool
 go test ./...
 ```
 
-Cross-compile for other devices: `$env:GOOS='linux'; go build -o bin/pool-linux ./cmd/pool`.
+`-trimpath` keeps your local folder paths out of the binary; use it for anything
+you share. Cross-compile for other devices:
+`$env:GOOS='linux'; go build -trimpath -o bin/pool-linux ./cmd/pool`.
 
 ## Set up a device
 
@@ -124,7 +144,7 @@ Cross-compile for other devices: `$env:GOOS='linux'; go build -o bin/pool-linux 
 2. Install the agent so it starts by itself (same flags as `pool agent`).
    On a laptop, lend only part of the CPU:
    ```powershell
-   pool install --allow desktop-jmc --max-jobs 2
+   pool install --allow desktop --max-jobs 2
    ```
 3. From another device: `pool nodes` should list it as `ready`.
 
@@ -182,11 +202,22 @@ the agents use.
 127 (couldn't start), 124 (timed out) and 130 (canceled).
 Jobs see `POOL_JOB_ID` and `POOL_NODE` in their environment.
 
+## Development
+
+Work happens on branches merged into `main` through pull requests. CI
+(`.github/workflows/ci.yml`) checks formatting, runs `go vet`, runs the tests
+on Windows, Linux and macOS (with the race detector on Linux), and runs
+`govulncheck`. `scripts/bench.ps1` measures speedup on real devices.
+
+## License
+
+[MIT](LICENSE).
+
 ## Roadmap and test plan
 
 | Milestone | Scope | How it's verified |
 |---|---|---|
 | **1. Remote run** ✅ | `pool run` on a named device, streaming, cancel/timeout, allow list | Unit + end-to-end tests (`go test ./...`), live run over Tailscale |
-| **2. Scheduling** ✅ | Pick the least-loaded device automatically; laptops lend CPU only on AC power; pause when CPU is busy | Unit tests for ranking, power and load parsing, and agent policy; live: jm-c on battery paused itself, busy desktop → job auto-placed on jm-c |
+| **2. Scheduling** ✅ | Pick the least-loaded device automatically; laptops lend CPU only on AC power; pause when CPU is busy | Unit tests for ranking, power and load parsing, and agent policy; live: laptop on battery paused itself, busy desktop → job auto-placed on laptop |
 | **3. Fan-out** ✅ | `pool map` across devices; ship and collect files; content cache; retry on device failure; backup copies of slow tasks | Unit tests for scheduling, retries, backups, cache, path safety; live benchmark 1.28× (90% of the possible 1.41× for these two machines) |
 | **4. Hardening** ✅ | Runs in the background and restarts itself; survives sleep and network changes; jobs die with the agent; `pool run` moves past unreachable devices; dashboard | Unit tests for job history, unreachable agents, log rotation, health check, dashboard state and Host check, task argument quoting; live on both devices: agents killed → both back within 56s; agent killed mid-job → job process gone |

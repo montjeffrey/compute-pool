@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -73,14 +74,63 @@ func (a *TailnetAuthorizer) Allowed() []string {
 	return out
 }
 
+// asciiEqualFold compares ignoring case for A-Z only. Unicode-aware folding
+// (strings.EqualFold, strings.ToLower) also maps look-alikes such as the
+// Kelvin sign to "k", which must not make two logins match.
+func asciiEqualFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		x, y := a[i], b[i]
+		if 'A' <= x && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if 'A' <= y && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
+}
+
+// Tailscale assigns addresses only from these ranges.
+var tailnetRanges = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("fd7a:115c:a1e0::/48"),
+}
+
+func inTailnetRange(ip string) bool {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, p := range tailnetRanges {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
 // Authorize implements Authorizer.
 func (a *TailnetAuthorizer) Authorize(ctx context.Context, remoteIP string) (Identity, error) {
+	// Anything else is refused before running tailscale, so a scanner on a
+	// LAN (possible with --listen) cannot make the agent spawn processes.
+	if !inTailnetRange(remoteIP) {
+		return Identity{}, fmt.Errorf("%w: %s is not a Tailscale address", ErrForbidden, remoteIP)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	who, err := a.whois(ctx, remoteIP)
 	if err != nil {
 		return Identity{}, fmt.Errorf("identify %s: %w", remoteIP, err)
 	}
 	id := Identity{Node: who.NodeName, Login: who.LoginName}
-	if !strings.EqualFold(who.LoginName, a.owner) {
+	if !asciiEqualFold(who.LoginName, a.owner) {
 		return id, fmt.Errorf("%w: %s belongs to %s, not %s", ErrForbidden, who.NodeName, who.LoginName, a.owner)
 	}
 	if !a.allow[who.NodeName] {

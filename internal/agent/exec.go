@@ -68,6 +68,7 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 	lowerPriority(cmd)
 	err = cmd.Wait()
 	dur := time.Since(start)
+	reapTree(cmd)
 
 	switch {
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):

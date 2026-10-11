@@ -175,6 +175,75 @@ func TestOpenLogFileRotates(t *testing.T) {
 	}
 }
 
+func TestRotatingLogRotatesWhileRunning(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.log")
+	l, err := newRotatingLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	chunk := bytes.Repeat([]byte("x"), 1<<20)
+	for i := 0; i < 12; i++ { // 12 MiB through a 10 MiB limit
+		if _, err := l.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cur, _ := os.Stat(path)
+	old, err := os.Stat(path + ".1")
+	if err != nil {
+		t.Fatal("no rotated file")
+	}
+	if cur.Size() > maxLogBytes || old.Size() > maxLogBytes {
+		t.Errorf("sizes after rotation: current %d, old %d", cur.Size(), old.Size())
+	}
+}
+
+func TestAgentHosts(t *testing.T) {
+	got := agentHosts("100.64.0.1:7470", tsutil.Peer{IPv4: "100.64.0.1", DNSName: "desktop.example.ts.net", Name: "desktop"})
+	want := []string{"100.64.0.1:7470", "100.64.0.1:7470", "desktop.example.ts.net:7470", "desktop:7470"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v", got)
+	}
+}
+
+func TestCappedBuffer(t *testing.T) {
+	var b cappedBuffer
+	b.Write(bytes.Repeat([]byte("a"), maxTaskOutput-2))
+	b.Write([]byte("bcde"))
+	b.Write([]byte("fg"))
+	out := b.Bytes()
+	if !bytes.HasPrefix(out, bytes.Repeat([]byte("a"), maxTaskOutput-2)) || !bytes.Contains(out, []byte("abc\n[pool: 4 more bytes")) {
+		t.Errorf("tail = %q", out[len(out)-50:])
+	}
+	var small cappedBuffer
+	small.Write([]byte("ok"))
+	if string(small.Bytes()) != "ok" {
+		t.Errorf("small = %q", small.Bytes())
+	}
+}
+
+func TestResolveOwned(t *testing.T) {
+	st := tsutil.Status{
+		Self: tsutil.Peer{Name: "desktop", IPv4: "100.64.0.1", Self: true, UserID: 1},
+		Peers: []tsutil.Peer{
+			{Name: "laptop", IPv4: "100.64.0.2", UserID: 1},
+			{Name: "friends-pc", IPv4: "100.64.0.3", UserID: 2},
+			{Name: "ci", IPv4: "100.64.0.4", UserID: 1, Tagged: true},
+		},
+	}
+	if p, err := resolveOwned(st, "laptop"); err != nil || p.IPv4 != "100.64.0.2" {
+		t.Errorf("laptop: %+v %v", p, err)
+	}
+	for _, n := range []string{"friends-pc", "100.64.0.3", "ci"} {
+		if _, err := resolveOwned(st, n); err == nil || !strings.Contains(err.Error(), "not one of your devices") {
+			t.Errorf("%s: err = %v", n, err)
+		}
+	}
+	if _, err := resolveOwned(st, "192.168.1.5"); err == nil {
+		t.Error("a non-tailnet IP was accepted")
+	}
+}
+
 func TestCheckListener(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -269,8 +338,8 @@ func TestDashboardHandler(t *testing.T) {
 func TestResultPrinterReportsFailures(t *testing.T) {
 	var out, errb bytes.Buffer
 	p := newResultPrinter(&out, &errb, false, false)
-	p.add(fanout.Result{Task: fanout.Task{Index: 2, Item: "b"}, Device: "jm-c", Outcome: fanout.Outcome{ExitCode: 4}})
-	if !strings.Contains(errb.String(), "task 2 (b) on jm-c: exit 4") {
+	p.add(fanout.Result{Task: fanout.Task{Index: 2, Item: "b"}, Device: "laptop", Outcome: fanout.Outcome{ExitCode: 4}})
+	if !strings.Contains(errb.String(), "task 2 (b) on laptop: exit 4") {
 		t.Errorf("stderr = %q", errb.String())
 	}
 }

@@ -12,7 +12,7 @@ func TestFrameRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	fw := NewFrameWriter(&buf, nil)
 	want := []Frame{
-		{Type: FrameStart, JobID: "j1", Node: "jm-c"},
+		{Type: FrameStart, JobID: "j1", Node: "laptop"},
 		{Type: FrameStdout, Data: []byte("hello\n")},
 		{Type: FrameStderr, Data: []byte{0x00, 0xff, '\n'}}, // binary-safe
 		{Type: FrameError, Message: "boom"},
@@ -88,6 +88,10 @@ func TestCleanRelPath(t *testing.T) {
 		"./x/../y.txt":  "y.txt",
 		"out":           "out",
 		"out/*.csv":     "out/*.csv",
+		"out/file?.txt": "out/file?.txt",
+		"console.log":   "console.log", // only exact device names are reserved
+		"com10.txt":     "com10.txt",
+		".hidden":       ".hidden",
 	}
 	for in, want := range ok {
 		got, err := CleanRelPath(in)
@@ -95,7 +99,9 @@ func TestCleanRelPath(t *testing.T) {
 			t.Errorf("CleanRelPath(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
-	for _, bad := range []string{"", ".", "..", "../x", "a/../../x", "/abs", `\abs`, "C:x", `C:\x`, "file.txt:stream"} {
+	for _, bad := range []string{"", ".", "..", "../x", "a/../../x", "/abs", `\abs`, "C:x", `C:\x`, "file.txt:stream",
+		"CON", "nul.txt", "out/aux", "COM1", "lpt9.log", "conin$", "trailing.", "trailing ", "dir./x",
+		"tab\there", "nul\x00byte", "a|b", "a<b", `a"b`} {
 		if got, err := CleanRelPath(bad); err == nil {
 			t.Errorf("CleanRelPath(%q) = %q, want error", bad, got)
 		}

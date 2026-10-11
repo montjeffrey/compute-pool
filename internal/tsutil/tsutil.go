@@ -22,31 +22,53 @@ import (
 
 // WhoIs identifies the owner of a tailnet address.
 type WhoIs struct {
-	NodeName  string // short node name, e.g. "jm-c"
+	NodeName  string // short node name, e.g. "laptop"
 	LoginName string // owning user, e.g. "someone@github"
 	OS        string
 }
 
 // Peer is one device on the tailnet.
 type Peer struct {
-	Name    string // short node name, e.g. "jm-c"
-	DNSName string // e.g. "jm-c.tailnet.ts.net"
+	Name    string // short node name, e.g. "laptop"
+	DNSName string // e.g. "laptop.example.ts.net"
 	IPv4    string
 	OS      string
 	Online  bool
 	Self    bool
+	UserID  int64 // owning user; all tagged devices share one pseudo-user
+	Tagged  bool  // owned by ACL tags rather than a person
 }
 
 // Status is the local view of the tailnet.
 type Status struct {
-	Self      Peer
-	SelfLogin string
-	Peers     []Peer // excludes Self
+	Self       Peer
+	SelfLogin  string
+	SelfTagged bool
+	Peers      []Peer // excludes Self
 }
 
 // All returns Self followed by every peer.
 func (s Status) All() []Peer {
 	return append([]Peer{s.Self}, s.Peers...)
+}
+
+// IsOwned reports whether p belongs to the same person as this device. Jobs,
+// shipped files and environment values must only ever go to such devices: a
+// device shared into the tailnet, or owned by another user or by tags, could
+// pose as an idle agent and receive them.
+func (s Status) IsOwned(p Peer) bool {
+	return p.Self || (!s.SelfTagged && !p.Tagged && p.UserID == s.Self.UserID)
+}
+
+// Owned returns Self followed by every peer this device's owner also owns.
+func (s Status) Owned() []Peer {
+	var out []Peer
+	for _, p := range s.All() {
+		if s.IsOwned(p) {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // Resolve finds a device by short name, full DNS name or Tailscale IP.
@@ -116,6 +138,7 @@ type rawPeer struct {
 	UserID       int64
 	TailscaleIPs []string
 	Online       bool
+	Tags         []string
 }
 
 func parseStatus(b []byte) (Status, error) {
@@ -132,8 +155,9 @@ func parseStatus(b []byte) (Status, error) {
 		return Status{}, fmt.Errorf("tailscale is not connected (state %s)", raw.BackendState)
 	}
 	st := Status{
-		Self:      convertPeer(raw.Self, true),
-		SelfLogin: raw.User[strconv.FormatInt(raw.Self.UserID, 10)].LoginName,
+		Self:       convertPeer(raw.Self, true),
+		SelfLogin:  raw.User[strconv.FormatInt(raw.Self.UserID, 10)].LoginName,
+		SelfTagged: len(raw.Self.Tags) > 0,
 	}
 	if st.Self.IPv4 == "" {
 		return Status{}, errors.New("this device has no Tailscale IPv4 address")
@@ -155,6 +179,8 @@ func convertPeer(p rawPeer, self bool) Peer {
 		OS:      p.OS,
 		Online:  p.Online || self,
 		Self:    self,
+		UserID:  p.UserID,
+		Tagged:  len(p.Tags) > 0,
 	}
 	for _, ip := range p.TailscaleIPs {
 		if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() != nil {
@@ -165,7 +191,7 @@ func convertPeer(p rawPeer, self bool) Peer {
 	return out
 }
 
-// normalizeName reduces "JM-C.tailnet.ts.net." to "jm-c".
+// normalizeName reduces "Laptop.example.ts.net." to "laptop".
 func normalizeName(name string) string {
 	name = strings.ToLower(strings.TrimSuffix(name, "."))
 	if i := strings.IndexByte(name, '.'); i >= 0 {

@@ -1,8 +1,8 @@
 // Command pool shares CPU between your own devices over Tailscale.
 //
-//	pool agent --allow desktop-jmc,jm-c   lend this device's CPU
+//	pool agent --allow desktop,laptop   lend this device's CPU
 //	pool nodes                            list devices running an agent
-//	pool run --node jm-c -- go test ./... run a command on another device
+//	pool run --node laptop -- go test ./... run a command on another device
 package main
 
 import (
@@ -11,7 +11,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -141,15 +140,29 @@ type probeResult struct {
 	err  error
 }
 
-// probeAll asks every online device for its agent's status, in parallel,
-// and returns the answers sorted by device name.
+// resolveOwned finds a device by name or Tailscale IP and refuses any that
+// this device's owner does not own, so jobs and their data never reach a
+// device that someone else controls.
+func resolveOwned(st tsutil.Status, name string) (tsutil.Peer, error) {
+	p, err := st.Resolve(name)
+	if err != nil {
+		return tsutil.Peer{}, err
+	}
+	if !st.IsOwned(p) {
+		return tsutil.Peer{}, fmt.Errorf("%s is not one of your devices (it belongs to another user or to tags); pool only sends work to devices you own", p.Name)
+	}
+	return p, nil
+}
+
+// probeAll asks every online device this device's owner also owns for its
+// agent's status, in parallel, and returns the answers sorted by name.
 func probeAll(ctx context.Context, st tsutil.Status, c *client.Client, timeout time.Duration) []probeResult {
 	var (
 		mu  sync.Mutex
 		out []probeResult
 		wg  sync.WaitGroup
 	)
-	for _, p := range st.All() {
+	for _, p := range st.Owned() {
 		if !p.Online || p.IPv4 == "" {
 			continue
 		}
@@ -277,22 +290,19 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 			return 1, err
 		}
 	} else {
-		host := *node
-		if net.ParseIP(host) == nil {
-			st, err := tsutil.GetStatus(ctx)
-			if err != nil {
-				return 1, err
-			}
-			p, err := st.Resolve(host)
-			if err != nil {
-				return 1, err
-			}
-			if !p.Online {
-				return 1, fmt.Errorf("%s is offline", p.Name)
-			}
-			host = p.IPv4
+		// Even a raw IP is looked up, so it must be a tailnet device you own.
+		st, err := tsutil.GetStatus(ctx)
+		if err != nil {
+			return 1, err
 		}
-		targets = []client.Candidate{{Name: *node, Host: host}}
+		p, err := resolveOwned(st, *node)
+		if err != nil {
+			return 1, err
+		}
+		if !p.Online {
+			return 1, fmt.Errorf("%s is offline", p.Name)
+		}
+		targets = []client.Candidate{{Name: p.Name, Host: p.IPv4}}
 	}
 
 	req := proto.RunRequest{Argv: argv, Shell: *shell, TimeoutSec: int(timeout.Seconds()), Collect: collect}

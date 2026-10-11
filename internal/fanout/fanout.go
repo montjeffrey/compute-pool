@@ -101,7 +101,14 @@ type queue struct {
 	remaining int
 	nextID    int
 	speculate bool
-	durations []time.Duration // wall time of finished attempts
+	durations []time.Duration            // wall time of finished attempts
+	byDevice  map[string][]time.Duration // the same, per device
+}
+
+func median(ds []time.Duration) time.Duration {
+	sorted := append([]time.Duration(nil), ds...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	return sorted[len(sorted)/2]
 }
 
 // acquire hands device a pending task or, when speculating and nothing is
@@ -137,14 +144,17 @@ func (q *queue) acquire(ctx context.Context, device string) (*queued, int, conte
 }
 
 // straggler picks the longest-running task that has run longer than the
-// median finished attempt, has no backup yet, and is not on device.
+// median finished attempt, has no backup yet, and is not on device. Only a
+// device that has itself finished tasks at least that fast may run backups:
+// a copy on a slower device would only waste work.
 func (q *queue) straggler(device string) *queued {
-	if len(q.durations) < 3 {
+	if len(q.durations) < 3 || len(q.byDevice[device]) == 0 {
 		return nil
 	}
-	sorted := append([]time.Duration(nil), q.durations...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-	threshold := sorted[len(sorted)/2]
+	threshold := median(q.durations)
+	if median(q.byDevice[device]) > threshold {
+		return nil
+	}
 
 	var best *queued
 	var bestAge time.Duration
@@ -192,8 +202,8 @@ func (q *queue) requeue(t *queued) {
 }
 
 // finish marks t done and cancels any other copy. It returns false if
-// another copy got there first.
-func (q *queue) finish(t *queued, wall time.Duration) bool {
+// another copy got there first. wall and device describe the winning run.
+func (q *queue) finish(t *queued, wall time.Duration, device string) bool {
 	q.mu.Lock()
 	if t.finished {
 		q.mu.Unlock()
@@ -205,6 +215,7 @@ func (q *queue) finish(t *queued, wall time.Duration) bool {
 	}
 	if wall > 0 {
 		q.durations = append(q.durations, wall)
+		q.byDevice[device] = append(q.byDevice[device], wall)
 	}
 	q.remaining--
 	q.mu.Unlock()
@@ -225,7 +236,7 @@ func Run(ctx context.Context, tasks []Task, devices []Device, opts Options) []Re
 
 	results := make([]Result, len(tasks))
 	all := make([]*queued, len(tasks))
-	q := &queue{remaining: len(tasks), running: map[*queued]bool{}, speculate: opts.Speculate}
+	q := &queue{remaining: len(tasks), running: map[*queued]bool{}, speculate: opts.Speculate, byDevice: map[string][]time.Duration{}}
 	q.cond = sync.NewCond(&q.mu)
 	for i, t := range tasks {
 		all[i] = &queued{Task: t, pos: i}
@@ -317,7 +328,7 @@ func Run(ctx context.Context, tasks []Task, devices []Device, opts Options) []Re
 					}
 					switch {
 					case err == nil:
-						if q.finish(t, time.Since(start)) {
+						if q.finish(t, time.Since(start), d.Name) {
 							report(t, Result{Outcome: out, Device: d.Name})
 						} else {
 							discard(out)
@@ -341,7 +352,7 @@ func Run(ctx context.Context, tasks []Task, devices []Device, opts Options) []Re
 							exhausted := t.attempts > opts.Retries
 							q.mu.Unlock()
 							if exhausted {
-								if q.finish(t, 0) {
+								if q.finish(t, 0, "") {
 									report(t, Result{Device: d.Name, Err: fmt.Errorf("%s: %w", d.Name, err)})
 								}
 							} else {

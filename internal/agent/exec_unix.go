@@ -25,6 +25,13 @@ func buildCommand(ctx context.Context, req proto.RunRequest) *exec.Cmd {
 	return cmd
 }
 
+// reapTree kills anything the job left running in its process group after
+// the main process exited, so background children can't outlive the job,
+// its slot accounting, or its scratch directory.
+func reapTree(cmd *exec.Cmd) {
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+}
+
 // lowerPriority renices the job's process group so the owner's foreground
 // work wins. Children started later inherit the niceness.
 func lowerPriority(cmd *exec.Cmd) {

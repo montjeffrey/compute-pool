@@ -54,5 +54,10 @@ func killTree(cmd *exec.Cmd) error {
 	return nil
 }
 
+// reapTree is a no-op on Windows: once the main process has exited its
+// children can no longer be found by parent, and the agent-wide job object
+// still ends them when the agent exits.
+func reapTree(*exec.Cmd) {}
+
 // lowerPriority is a no-op on Windows; CreationFlags already set the class.
 func lowerPriority(*exec.Cmd) {}

@@ -103,6 +103,45 @@ func TestParseStatus(t *testing.T) {
 	}
 }
 
+func TestOwnedExcludesOtherUsersAndTags(t *testing.T) {
+	data := `{
+  "BackendState": "Running",
+  "Self": {"DNSName": "desktop.x.ts.net.", "UserID": 42, "TailscaleIPs": ["100.64.0.1"]},
+  "Peer": {
+    "a": {"DNSName": "laptop.x.ts.net.", "UserID": 42, "TailscaleIPs": ["100.64.0.2"], "Online": true},
+    "b": {"DNSName": "friends-pc.x.ts.net.", "UserID": 77, "TailscaleIPs": ["100.64.0.3"], "Online": true},
+    "c": {"DNSName": "ci-runner.x.ts.net.", "UserID": 42, "Tags": ["tag:ci"], "TailscaleIPs": ["100.64.0.4"], "Online": true}
+  },
+  "User": {"42": {"LoginName": "alice@github"}, "77": {"LoginName": "bob@github"}}
+}`
+	st, err := parseStatus([]byte(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, p := range st.Owned() {
+		names = append(names, p.Name)
+	}
+	if len(names) != 2 || names[0] != "desktop" || names[1] != "laptop" {
+		t.Errorf("Owned() = %v, want [desktop laptop]", names)
+	}
+	for _, n := range []string{"friends-pc", "ci-runner"} {
+		p, err := st.Resolve(n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.IsOwned(p) {
+			t.Errorf("%s counted as owned", n)
+		}
+	}
+
+	// On a tagged device, nothing but itself counts as owned.
+	st.SelfTagged = true
+	if got := st.Owned(); len(got) != 1 || !got[0].Self {
+		t.Errorf("tagged self: Owned() = %+v", got)
+	}
+}
+
 func TestParseStatusNotRunning(t *testing.T) {
 	if _, err := parseStatus([]byte(`{"BackendState":"Stopped"}`)); err == nil {
 		t.Error("want error when tailscale is stopped")

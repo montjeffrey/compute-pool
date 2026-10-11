@@ -25,6 +25,12 @@ func newFileCache(dir string, maxBytes int64) (*fileCache, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
+	// Uploads interrupted by a crash leave temp files behind.
+	if stale, err := filepath.Glob(filepath.Join(dir, "incoming-*")); err == nil {
+		for _, p := range stale {
+			os.Remove(p)
+		}
+	}
 	return &fileCache{dir: dir, maxBytes: maxBytes}, nil
 }
 

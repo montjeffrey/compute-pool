@@ -5,8 +5,11 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/montjeffrey/compute-pool/internal/proto"
@@ -49,6 +52,58 @@ func TestUnreachableAgent(t *testing.T) {
 	cancel()
 	if _, err := c.Info(ctx, "127.0.0.1"); errors.Is(err, ErrUnreachable) {
 		t.Error("a canceled request was reported as unreachable")
+	}
+}
+
+func TestFileSinkDistrustsAgent(t *testing.T) {
+	dir := t.TempDir()
+	s := newFileSink(dir)
+	if err := s.write("out/a.txt", []byte("one ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.write("out/a.txt", []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.write("out/b.txt", []byte("b")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.write("out/a.txt", []byte("again")); err == nil || !strings.Contains(err.Error(), "twice") {
+		t.Errorf("re-sent file: err = %v", err)
+	}
+	for _, bad := range []string{"../escape", "C:/x", "nul"} {
+		if err := s.write(bad, []byte("x")); err == nil {
+			t.Errorf("unsafe path %q accepted", bad)
+		}
+	}
+	if err := s.close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "out", "a.txt")); string(got) != "one two" {
+		t.Errorf("a.txt = %q", got)
+	}
+	if !reflect.DeepEqual(s.order, []string{"out/a.txt", "out/b.txt"}) {
+		t.Errorf("order = %v", s.order)
+	}
+
+	unrequested := newFileSink("")
+	if err := unrequested.write("x", nil); err == nil {
+		t.Error("files accepted without an output directory")
+	}
+}
+
+func TestFileSinkRefusesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.Symlink(target, filepath.Join(dir, "link.txt")); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	s := newFileSink(dir)
+	defer s.close()
+	if err := s.write("link.txt", []byte("x")); err == nil {
+		t.Error("wrote through a symbolic link")
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Error("the symlink target was created")
 	}
 }
 

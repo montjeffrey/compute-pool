@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -471,6 +472,98 @@ func TestUnsafePathsRejected(t *testing.T) {
 	}
 	if !strings.Contains(res.RemoteError, "unsafe path") {
 		t.Errorf("collect ../*: result = %+v", res)
+	}
+}
+
+func TestBrowserRequestsRejected(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	base := "http://" + net.JoinHostPort(h.host, strconv.Itoa(h.client.Port))
+	body := `{"argv":["whoami"]}`
+	send := func(method, path, contentType string, headers map[string]string) int {
+		t.Helper()
+		req, err := http.NewRequest(method, base+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// A web page can send text/plain without a preflight; it must be refused.
+	if code := send("POST", "/v1/run", "text/plain", nil); code != http.StatusUnsupportedMediaType {
+		t.Errorf("text/plain run: %d, want 415", code)
+	}
+	if code := send("POST", "/v1/run", "application/json", map[string]string{"Origin": "http://evil.example"}); code != http.StatusForbidden {
+		t.Errorf("run with Origin: %d, want 403", code)
+	}
+	if code := send("GET", "/v1/jobs", "", map[string]string{"Sec-Fetch-Site": "cross-site"}); code != http.StatusForbidden {
+		t.Errorf("jobs with Sec-Fetch-Site cross-site: %d, want 403", code)
+	}
+	if code := send("GET", "/v1/info", "", map[string]string{"Sec-Fetch-Site": "none"}); code != http.StatusOK {
+		t.Errorf("info typed into the address bar (Sec-Fetch-Site none): %d, want 200", code)
+	}
+
+	// With allowed hosts set, a rebound hostname is refused.
+	h.agent.SetAllowedHosts([]string{net.JoinHostPort(h.host, strconv.Itoa(h.client.Port))})
+	if code := send("GET", "/v1/info", "", nil); code != http.StatusOK {
+		t.Errorf("info with the agent's own Host: %d, want 200", code)
+	}
+	req, _ := http.NewRequest("GET", base+"/v1/info", nil)
+	req.Host = "attacker.example:7470"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("info with a rebound Host: %d, want 403", resp.StatusCode)
+	}
+	// The real client still works.
+	if res, _, _, err := h.run(t, context.Background(), helperRequest(t, "echo", nil)); err != nil || res.ExitCode != 3 {
+		t.Errorf("client run: %+v %v", res, err)
+	}
+}
+
+func TestTooManyFilesRejected(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	req := helperRequest(t, "pwd", nil)
+	for i := 0; i <= 10000; i++ {
+		req.Files = append(req.Files, proto.InputFile{Path: fmt.Sprintf("f%d", i)})
+	}
+	_, _, _, err := h.run(t, context.Background(), req)
+	if err == nil || !strings.Contains(err.Error(), "more than 10000 files") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestStaleJobDirsRemovedAtStartup(t *testing.T) {
+	dir := t.TempDir()
+	stale := filepath.Join(dir, "job-123")
+	if err := os.MkdirAll(filepath.Join(stale, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	keep := filepath.Join(dir, "not-a-job")
+	if err := os.WriteFile(keep, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agent.New(agent.Config{NodeName: "n", MaxJobs: 1, WorkDir: dir, Auth: allowAll{}, Logger: log.New(io.Discard, "", 0)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Error("stale job folder survived startup")
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Error("an unrelated file was removed")
 	}
 }
 

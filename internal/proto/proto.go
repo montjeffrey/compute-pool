@@ -72,18 +72,47 @@ type MissingFiles struct {
 }
 
 // CleanRelPath normalizes p to a slash-separated relative path and rejects
-// anything that could escape the directory it is joined to: absolute paths,
-// "..", drive letters and other colons.
+// anything that could escape the directory it is joined to (absolute paths,
+// "..", drive letters and other colons) or that Windows treats specially
+// (device names such as CON or NUL, names ending in a dot or space, control
+// characters). It is applied on both sides: agents check what they are sent,
+// and clients check what agents send back.
 func CleanRelPath(p string) (string, error) {
 	p = strings.ReplaceAll(p, `\`, "/")
-	if p == "" || strings.HasPrefix(p, "/") || strings.Contains(p, ":") {
+	if p == "" || strings.HasPrefix(p, "/") || strings.ContainsAny(p, ":\"<>|") {
 		return "", fmt.Errorf("unsafe path %q", p)
+	}
+	for _, r := range p {
+		if r < 0x20 || r == 0x7f {
+			return "", fmt.Errorf("unsafe path %q", p)
+		}
 	}
 	c := path.Clean(p)
 	if c == "." || c == ".." || strings.HasPrefix(c, "../") {
 		return "", fmt.Errorf("unsafe path %q", p)
 	}
+	for _, part := range strings.Split(c, "/") {
+		if strings.HasSuffix(part, ".") || strings.HasSuffix(part, " ") || windowsReserved(part) {
+			return "", fmt.Errorf("unsafe path %q", p)
+		}
+	}
 	return c, nil
+}
+
+// windowsReserved reports whether name is a DOS device name, which Windows
+// resolves to a device regardless of directory or extension ("nul.txt").
+func windowsReserved(name string) bool {
+	base := strings.ToUpper(name)
+	if i := strings.IndexByte(base, '.'); i >= 0 {
+		base = base[:i]
+	}
+	base = strings.TrimRight(base, " ")
+	switch base {
+	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$":
+		return true
+	}
+	return len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) &&
+		base[3] >= '0' && base[3] <= '9'
 }
 
 // FrameType identifies what a Frame carries.

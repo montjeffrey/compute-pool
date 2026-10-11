@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -57,6 +59,9 @@ type Agent struct {
 	histMu  sync.Mutex
 	active  map[string]*proto.JobRecord
 	history []proto.JobRecord // finished jobs, oldest first, at most historySize
+
+	hostsMu      sync.RWMutex
+	allowedHosts map[string]bool // empty: any Host header
 }
 
 const historySize = 50
@@ -127,6 +132,13 @@ func New(cfg Config) (*Agent, error) {
 	if err := os.MkdirAll(cfg.WorkDir, 0o700); err != nil {
 		return nil, fmt.Errorf("agent: create work dir: %w", err)
 	}
+	// No job is running yet, so any job folder here was left by an agent
+	// that crashed or was killed.
+	if stale, err := filepath.Glob(filepath.Join(cfg.WorkDir, "job-*")); err == nil {
+		for _, p := range stale {
+			os.RemoveAll(p)
+		}
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = log.New(os.Stderr, "", log.LstdFlags)
 	}
@@ -174,10 +186,46 @@ func (a *Agent) Handler() http.Handler {
 
 type identityKey struct{}
 
+// SetAllowedHosts limits which Host headers the agent answers ("ip:port",
+// "name:port"). Empty means any. Checking it stops DNS rebinding, where a web
+// page points a hostname it controls at the agent's address.
+func (a *Agent) SetAllowedHosts(hosts []string) {
+	set := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		set[strings.ToLower(h)] = true
+	}
+	a.hostsMu.Lock()
+	a.allowedHosts = set
+	a.hostsMu.Unlock()
+}
+
+func (a *Agent) hostAllowed(host string) bool {
+	a.hostsMu.RLock()
+	defer a.hostsMu.RUnlock()
+	return len(a.allowedHosts) == 0 || a.allowedHosts[strings.ToLower(host)]
+}
+
+// fromBrowser reports whether a request was sent by a web page. The pool
+// client never sends these headers; browsers always do for cross-site
+// requests. Without this check, any page open in a browser on an allowed
+// device could post jobs, because the request comes from that device's IP.
+func fromBrowser(r *http.Request) bool {
+	if r.Header.Get("Origin") != "" {
+		return true
+	}
+	site := r.Header.Get("Sec-Fetch-Site")
+	return site != "" && site != "none"
+}
+
 func (a *Agent) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if !a.hostAllowed(r.Host) || fromBrowser(r) {
+			a.cfg.Logger.Printf("refused %s %s from %s: browser-originated request or unexpected Host %q", r.Method, r.URL.Path, host, r.Host)
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -247,23 +295,18 @@ func (a *Agent) handleInfo(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(a.info())
 }
 
-func (a *Agent) handleRun(w http.ResponseWriter, r *http.Request) {
-	var req proto.RunRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, proto.MaxRequestBytes)).Decode(&req); err != nil {
-		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if len(req.Argv) == 0 || req.Argv[0] == "" {
-		http.Error(w, "bad request: argv is empty", http.StatusBadRequest)
-		return
-	}
+// maxFilesPerRequest bounds how many input files one job may ship.
+const maxFilesPerRequest = 10000
 
-	if missing := a.missingFiles(req.Files); len(missing) > 0 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusPreconditionFailed)
-		_ = json.NewEncoder(w).Encode(proto.MissingFiles{Missing: missing})
+func (a *Agent) handleRun(w http.ResponseWriter, r *http.Request) {
+	// A JSON content type cannot be sent cross-site without a CORS preflight,
+	// which the agent never answers: a second guard against web pages.
+	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+		http.Error(w, "content type must be application/json", http.StatusUnsupportedMediaType)
 		return
 	}
+	// Refuse before reading the body, so busy agents don't buffer uploads
+	// they will reject, and at most MaxJobs bodies are in memory at once.
 	if reason := a.refusal(a.snapshot()); reason != "" {
 		http.Error(w, reason, http.StatusServiceUnavailable)
 		return
@@ -273,6 +316,26 @@ func (a *Agent) handleRun(w http.ResponseWriter, r *http.Request) {
 		defer func() { <-a.slots }()
 	default:
 		http.Error(w, fmt.Sprintf("all %d job slots in use", a.cfg.MaxJobs), http.StatusServiceUnavailable)
+		return
+	}
+
+	var req proto.RunRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, proto.MaxRequestBytes)).Decode(&req); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(req.Argv) == 0 || req.Argv[0] == "" {
+		http.Error(w, "bad request: argv is empty", http.StatusBadRequest)
+		return
+	}
+	if len(req.Files) > maxFilesPerRequest {
+		http.Error(w, fmt.Sprintf("bad request: more than %d files", maxFilesPerRequest), http.StatusBadRequest)
+		return
+	}
+	if missing := a.missingFiles(req.Files); len(missing) > 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPreconditionFailed)
+		_ = json.NewEncoder(w).Encode(proto.MissingFiles{Missing: missing})
 		return
 	}
 	a.running.Add(1)

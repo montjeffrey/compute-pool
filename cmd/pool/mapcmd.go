@@ -32,6 +32,37 @@ const maxShipBytes = 180 << 20
 
 const maxTasks = 100000
 
+// maxTaskOutput caps how much of each task's stdout and stderr is held for
+// printing, so a misbehaving agent cannot exhaust the client's memory.
+const maxTaskOutput = 16 << 20
+
+// cappedBuffer keeps the first maxTaskOutput bytes written and counts the rest.
+type cappedBuffer struct {
+	buf     bytes.Buffer
+	dropped int64
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	room := maxTaskOutput - b.buf.Len()
+	switch {
+	case room <= 0:
+		b.dropped += int64(len(p))
+	case len(p) > room:
+		b.buf.Write(p[:room])
+		b.dropped += int64(len(p) - room)
+	default:
+		b.buf.Write(p)
+	}
+	return len(p), nil
+}
+
+func (b *cappedBuffer) Bytes() []byte {
+	if b.dropped == 0 {
+		return b.buf.Bytes()
+	}
+	return append(b.buf.Bytes(), fmt.Sprintf("\n[pool: %d more bytes of output were dropped]\n", b.dropped)...)
+}
+
 type listFlag []string
 
 func (l *listFlag) String() string     { return strings.Join(*l, ",") }
@@ -250,7 +281,7 @@ func cmdMap(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 				}
 				req.Files = append(append([]proto.InputFile(nil), shipped...), proto.InputFile{Path: t.Item, Data: data})
 			}
-			var so, se bytes.Buffer
+			var so, se cappedBuffer
 			out := client.Output{Stdout: &so, Stderr: &se}
 			if len(collect) > 0 {
 				// Each copy of a task gets its own folder; the winner's is
@@ -365,7 +396,7 @@ func mapDevices(ctx context.Context, c *client.Client, only string, timeout time
 	want := map[string]bool{}
 	for _, n := range strings.Split(only, ",") {
 		if n = strings.TrimSpace(n); n != "" {
-			p, err := st.Resolve(n)
+			p, err := resolveOwned(st, n)
 			if err != nil {
 				return nil, err
 			}
