@@ -412,7 +412,11 @@ function jobTable(target, jobs, running) {
   box.replaceChildren();
   if (!jobs.length) { box.appendChild(el("div", "empty", running ? "Nothing running." : "No jobs yet.")); return; }
   const t = el("table"), head = el("thead"), body = el("tbody");
-  head.appendChild(row(running ? ["Device", "From", "Command", "Started"] : ["Device", "From", "Command", "Finished", "Took", "Result"]));
+  const hr = el("tr");
+  for (const h of running ? ["Device", "From", "Command", "Started"] : ["Device", "From", "Command", "Finished", "Took", "Result"]) {
+    hr.appendChild(el("th", null, h));
+  }
+  head.appendChild(hr);
   for (const j of jobs) {
     const cmd = el("td", "cmd", j.command);
     if (running) { body.appendChild(row([j.device, j.from, cmd, ago(j.started)])); continue; }

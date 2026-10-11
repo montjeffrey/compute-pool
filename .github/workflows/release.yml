@@ -1,0 +1,47 @@
+name: Release
+
+# Pushing a tag like v0.1.0 tests the tagged commit, builds pool for every
+# supported platform on GitHub's runners, and publishes a release with the
+# binaries and their SHA-256 checksums. Notes come from docs/releases/<tag>.md
+# when that file exists.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Test
+        run: go test ./...
+      - name: Build
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          mkdir dist
+          for target in windows/amd64 windows/arm64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            ext=""; [ "$os" = windows ] && ext=".exe"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X github.com/montjeffrey/compute-pool/internal/proto.Version=$version" \
+              -o "dist/pool-$version-$os-$arch$ext" ./cmd/pool
+          done
+          (cd dist && sha256sum * > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          notes="docs/releases/$TAG.md"
+          if [ -f "$notes" ]; then flags=(--notes-file "$notes"); else flags=(--generate-notes); fi
+          gh release create "$TAG" dist/* --title "$TAG" --verify-tag "${flags[@]}"

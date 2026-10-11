@@ -12,9 +12,22 @@ pool map --inputs 'data/*.csv' --ship analyze.py --collect out -- python analyze
                                          # one task per file, spread over every device
 ```
 
-Status: pre-release. Works on Windows (tested on two machines); Linux and macOS
-build and pass the test suite in CI. See [SECURITY.md](SECURITY.md) before
-running an agent.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/dashboard-dark.png">
+  <img alt="The pool dashboard: five devices with their status, CPU load, idle CPUs, job slots and power, followed by running and recent jobs" src="docs/images/dashboard-light.png">
+</picture>
+
+Status: **v0.1.0**, early. Works on Windows (tested on two machines); Linux and
+macOS build and pass the test suite in CI. See [SECURITY.md](SECURITY.md)
+before running an agent.
+
+## Install
+
+Download the binary for your platform from
+[Releases](https://github.com/montjeffrey/compute-pool/releases), verify it
+against `SHA256SUMS`, rename it to `pool` (`pool.exe` on Windows) and put it on
+your `PATH`. Release binaries are built by GitHub Actions from the tagged
+commit. They aren't code-signed yet, so Windows may warn before running them.
 
 ## Splitting work with `pool map`
 
@@ -208,6 +221,18 @@ Work happens on branches merged into `main` through pull requests. CI
 (`.github/workflows/ci.yml`) checks formatting, runs `go vet`, runs the tests
 on Windows, Linux and macOS (with the race detector on Linux), and runs
 `govulncheck`. `scripts/bench.ps1` measures speedup on real devices.
+
+To see the dashboard without any devices, serve it with made-up data (this is
+what the screenshot shows):
+
+```bash
+POOL_DEMO_DASHBOARD=127.0.0.1:7472 go test ./cmd/pool -run TestDemoDashboard -timeout 0
+```
+
+Releases: pushing a tag such as `v0.2.0` runs `.github/workflows/release.yml`,
+which tests the tagged commit, builds binaries for Windows, Linux and macOS
+(x64 and Arm) with the version stamped in, and publishes them with checksums and
+the notes in `docs/releases/<tag>.md`.
 
 ## License
 

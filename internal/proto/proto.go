@@ -17,12 +17,12 @@ import (
 	"time"
 )
 
-const (
-	// DefaultPort is the TCP port agents listen on.
-	DefaultPort = 7470
-	// Version is reported by agents and the CLI.
-	Version = "0.1.0-dev"
-)
+// DefaultPort is the TCP port agents listen on.
+const DefaultPort = 7470
+
+// Version is reported by agents and the CLI. Release builds set it from the
+// git tag with -ldflags "-X github.com/montjeffrey/compute-pool/internal/proto.Version=…".
+var Version = "dev"
 
 const (
 	// MaxRequestBytes caps a RunRequest, including base64-encoded input
