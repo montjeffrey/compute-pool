@@ -29,6 +29,16 @@ against `SHA256SUMS`, rename it to `pool` (`pool.exe` on Windows) and put it on
 your `PATH`. Release binaries are built by GitHub Actions from the tagged
 commit. They aren't code-signed yet, so Windows may warn before running them.
 
+Releases after v0.1.0 also carry build provenance: a signed record that each
+binary was built by this repository's release workflow. Check it with the
+GitHub CLI:
+
+```bash
+gh attestation verify pool-0.2.0-windows-amd64.exe --repo montjeffrey/compute-pool
+```
+
+Commits and release tags are signed, and show as **Verified** on GitHub.
+
 ## Splitting work with `pool map`
 
 `pool map` runs one task per item, using every free job slot on every device.
@@ -231,8 +241,9 @@ POOL_DEMO_DASHBOARD=127.0.0.1:7472 go test ./cmd/pool -run TestDemoDashboard -ti
 
 Releases: pushing a tag such as `v0.2.0` runs `.github/workflows/release.yml`,
 which tests the tagged commit, builds binaries for Windows, Linux and macOS
-(x64 and Arm) with the version stamped in, and publishes them with checksums and
-the notes in `docs/releases/<tag>.md`.
+(x64 and Arm) with the version stamped in, and publishes them with checksums,
+build provenance attestations and the notes in `docs/releases/<tag>.md`. Tag
+releases with `git tag -s` so the tag is signed.
 
 ## License
 

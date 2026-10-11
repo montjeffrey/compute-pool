@@ -4,6 +4,12 @@ name: Release
 # supported platform on GitHub's runners, and publishes a release with the
 # binaries and their SHA-256 checksums. Notes come from docs/releases/<tag>.md
 # when that file exists.
+#
+# Windows binaries carry version details (product, version, copyright) shown
+# under Properties > Details. Each binary also gets a build provenance
+# attestation tying it to this repository and workflow; GitHub only offers
+# attestations for public repositories on this plan, so that step is skipped
+# while the repository is private.
 
 on:
   push:
@@ -11,6 +17,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   release:
@@ -22,6 +30,15 @@ jobs:
           go-version: stable
       - name: Test
         run: go test ./...
+      - name: Windows version details
+        env:
+          TAG: ${{ github.ref_name }}
+        working-directory: cmd/pool
+        run: |
+          go run github.com/tc-hib/go-winres@v0.3.3 simply --arch amd64,arm64 --manifest cli \
+            --product-name compute-pool --file-description "pool: share CPU between your own devices" \
+            --copyright "Copyright (c) 2026 Jeffrey Montoya" --original-filename pool.exe \
+            --product-version "${TAG#v}" --file-version "${TAG#v}"
       - name: Build
         env:
           TAG: ${{ github.ref_name }}
@@ -37,6 +54,11 @@ jobs:
           done
           (cd dist && sha256sum * > SHA256SUMS)
           cat dist/SHA256SUMS
+      - name: Attest build provenance
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: "dist/pool-*"
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
