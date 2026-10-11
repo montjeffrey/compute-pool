@@ -338,9 +338,6 @@ func (a *Agent) handleRun(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(proto.MissingFiles{Missing: missing})
 		return
 	}
-	a.running.Add(1)
-	defer a.running.Add(-1)
-
 	id, _ := r.Context().Value(identityKey{}).(Identity)
 	jobID := fmt.Sprintf("%s-%s-%d", a.cfg.NodeName, time.Now().Format("20060102T150405"), a.seq.Add(1))
 	a.cfg.Logger.Printf("job %s from %s: %q (shell=%v)", jobID, id.Node, req.Argv, req.Shell)
@@ -355,9 +352,13 @@ func (a *Agent) handleRun(w http.ResponseWriter, r *http.Request) {
 	})
 	_ = fw.Write(proto.Frame{Type: proto.FrameStart, JobID: jobID, Node: a.cfg.NodeName})
 
+	// Register the job before counting it, and record it before uncounting
+	// it, so Running() and Jobs() always agree.
 	a.jobStarted(jobID, id.Node, req)
+	a.running.Add(1)
 	code, dur, err := a.execute(r.Context(), jobID, req, fw)
 	a.jobFinished(jobID, code, dur, err)
+	a.running.Add(-1)
 	if err != nil {
 		_ = fw.Write(proto.Frame{Type: proto.FrameError, Message: err.Error()})
 	}

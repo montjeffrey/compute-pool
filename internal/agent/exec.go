@@ -63,6 +63,9 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
+		if ctx.Err() != nil { // canceled before the process could start
+			return exitCanceled, 0, errors.New("job canceled")
+		}
 		return exitNotStarted, 0, fmt.Errorf("start %s: %w", req.Argv[0], err)
 	}
 	lowerPriority(cmd)

@@ -196,15 +196,16 @@ func TestRunUsesFreshScratchDirAndRemovesIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Resolve links first: on macOS the temp dir is under /var, a link to
-	// /private/var, and the job reports the resolved path.
-	realWork, err := filepath.EvalSymlinks(h.workDir)
-	if err != nil {
-		t.Fatal(err)
+	// Compare resolved paths: macOS reports /var as /private/var, and
+	// Windows may report short names (RUNNER~1). The job folder itself is
+	// already deleted, so resolve its parent, which must be the work dir.
+	if !strings.HasPrefix(filepath.Base(dir), "job-") {
+		t.Fatalf("job ran in %q, want a job-* folder", dir)
 	}
-	rel, err := filepath.Rel(realWork, dir)
-	if err != nil || strings.HasPrefix(rel, "..") || rel == "." {
-		t.Fatalf("job ran in %q, want a subdirectory of %q", dir, h.workDir)
+	parent, err1 := filepath.EvalSymlinks(filepath.Dir(dir))
+	work, err2 := filepath.EvalSymlinks(h.workDir)
+	if err1 != nil || err2 != nil || !strings.EqualFold(parent, work) {
+		t.Fatalf("job ran in %q, want a subdirectory of %q (%v %v)", dir, h.workDir, err1, err2)
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Errorf("scratch dir %q still exists after the job (err=%v)", dir, err)
@@ -582,6 +583,9 @@ func TestJobHistory(t *testing.T) {
 	defer cancel()
 	go func() { _, _, _, _ = h.run(t, ctx, helperRequest(t, "sleep", nil)) }()
 	waitFor(t, "sleep job to start", func() bool { return h.agent.Running() == 1 })
+	if n := len(h.agent.Jobs().Running); n != 1 {
+		t.Fatalf("Running() is 1 but Jobs() lists %d running jobs", n)
+	}
 
 	jobs, err := h.client.Jobs(context.Background(), h.host)
 	if err != nil {
