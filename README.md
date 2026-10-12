@@ -27,7 +27,10 @@ Download the binary for your platform from
 [Releases](https://github.com/montjeffrey/compute-pool/releases), verify it
 against `SHA256SUMS`, rename it to `pool` (`pool.exe` on Windows) and put it on
 your `PATH`. Release binaries are built by GitHub Actions from the tagged
-commit. They aren't code-signed yet, so Windows may warn before running them.
+commit. They aren't code-signed yet, so Windows may warn before running them, and
+on a PC with Smart App Control turned on it may refuse to run them at all.
+Smart App Control judges each file separately, so one release can run while the
+next is blocked.
 
 Releases after v0.1.0 also carry build provenance: a signed record that each
 binary was built by this repository's release workflow. Check it with the
