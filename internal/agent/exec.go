@@ -39,13 +39,14 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 		}
 	}()
 
-	shipped, err := writeInputs(dir, req.Files, a.cache)
+	program := shippedProgram(req)
+	shipped, err := writeInputs(dir, req.Files, a.cache, program)
 	if err != nil {
 		return exitNotStarted, 0, err
 	}
-	if !req.Shell && len(shipped) > 0 {
+	if program != "" {
 		argv := append([]string(nil), req.Argv...)
-		argv[0] = resolveProgram(argv[0], shipped)
+		argv[0] = shipped[program]
 		req.Argv = argv
 	}
 

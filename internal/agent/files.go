@@ -17,8 +17,9 @@ var errCollectTooBig = fmt.Errorf("collected files exceed %d MiB", proto.MaxColl
 
 // writeInputs writes shipped files into the job directory and returns their
 // absolute paths keyed by cleaned relative path. Files sent with a hash are
-// verified and added to cache; files marked Cached are copied from it.
-func writeInputs(dir string, files []proto.InputFile, cache *fileCache) (map[string]string, error) {
+// verified and added to cache; files marked Cached are copied from it. The
+// file at path program (see shippedProgram) is linked from the cache instead.
+func writeInputs(dir string, files []proto.InputFile, cache *fileCache, program string) (map[string]string, error) {
 	written := make(map[string]string, len(files))
 	for _, f := range files {
 		rel, err := proto.CleanRelPath(f.Path)
@@ -34,13 +35,23 @@ func writeInputs(dir string, files []proto.InputFile, cache *fileCache) (map[str
 			if cache == nil {
 				return nil, errors.New("input file: caching is off on this agent")
 			}
-			if err := cache.copyTo(f.SHA256, dst); err != nil {
+			place := cache.copyTo
+			if rel == program {
+				place = cache.linkTo
+			}
+			if err := place(f.SHA256, dst); err != nil {
 				return nil, fmt.Errorf("input file %s: %w", rel, err)
 			}
 		default:
 			if f.SHA256 != "" && cache != nil {
 				if err := cache.put(f.SHA256, f.Data); err != nil {
 					return nil, fmt.Errorf("input file %s: %w", rel, err)
+				}
+				if rel == program {
+					if err := cache.linkTo(f.SHA256, dst); err != nil {
+						return nil, fmt.Errorf("input file %s: %w", rel, err)
+					}
+					break
 				}
 			}
 			// Owner-executable so shipped programs and scripts can run.
@@ -53,23 +64,31 @@ func writeInputs(dir string, files []proto.InputFile, cache *fileCache) (map[str
 	return written, nil
 }
 
-// resolveProgram points argv[0] at a shipped file when it names one, so
-// `--ship tool.exe -- tool.exe` runs the shipped copy rather than searching
-// PATH (which never includes the job directory).
-func resolveProgram(argv0 string, shipped map[string]string) string {
-	rel, err := proto.CleanRelPath(argv0)
+// shippedProgram returns the cleaned path of the shipped file that argv[0]
+// names, so `--ship tool.exe -- tool.exe` runs the shipped copy rather than
+// searching PATH (which never includes the job directory). It returns "" for
+// shell jobs and when argv[0] names no shipped file.
+func shippedProgram(req proto.RunRequest) string {
+	if req.Shell || len(req.Argv) == 0 {
+		return ""
+	}
+	rel, err := proto.CleanRelPath(req.Argv[0])
 	if err != nil {
-		return argv0
+		return ""
 	}
-	if p, ok := shipped[rel]; ok {
-		return p
-	}
-	if runtime.GOOS == "windows" && !strings.HasSuffix(strings.ToLower(rel), ".exe") {
-		if p, ok := shipped[rel+".exe"]; ok {
-			return p
+	names := make(map[string]bool, len(req.Files))
+	for _, f := range req.Files {
+		if p, err := proto.CleanRelPath(f.Path); err == nil {
+			names[p] = true
 		}
 	}
-	return argv0
+	if names[rel] {
+		return rel
+	}
+	if runtime.GOOS == "windows" && !strings.HasSuffix(strings.ToLower(rel), ".exe") && names[rel+".exe"] {
+		return rel + ".exe"
+	}
+	return ""
 }
 
 // collectOutputs sends every regular file matching patterns back as file

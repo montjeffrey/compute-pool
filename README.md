@@ -66,8 +66,13 @@ Choose the items with exactly one of:
   `--speculate=false` for tasks that do more than produce output (send
   email, write to a shared database, and so on).
 - Agents **cache shipped files** by SHA-256 (`--cache-mb 2048`), so a program
-  shipped with 1,000 tasks crosses the network once per device. Content is
-  verified against its hash before it is cached.
+  shipped with 1,000 tasks crosses the network once per device, and later
+  runs reuse it. Content is verified against its hash before it is cached.
+  A shipped program runs as a hard link to its cached copy, which is
+  re-verified before each use, so antivirus scans it once rather than once per
+  task (Windows Defender adds about half a second to each new copy of a
+  program). Other shipped files are copied, so a task can't change another
+  task's input.
 
 Paths are checked on both sides: inputs and collected files can't use `..`,
 absolute paths, drive letters, Windows device names (`CON`, `NUL`, …) or
@@ -84,15 +89,16 @@ on the desktop) on one device and on all devices:
 
 | Setup | 1 device | 2 devices | Speedup |
 |---|---|---|---|
-| desktop (10 slots) + laptop lending **2** slots, 48 tasks | 11.7s | 12.3s | 0.95× |
-| desktop (10 slots) + laptop lending **8** slots, 96 tasks | 22.1s | 17.2s | **1.28×** |
+| desktop (10 slots) + laptop lending **2** slots, 48 tasks | 10.5s | 9.5s | 1.10× |
+| desktop (10 slots) + laptop lending **8** slots, 96 tasks | 18.5s | 14.1s | **1.31×** |
 
-The best possible result for the second setup is about 1.41× (desktop ~5.7
-tasks/s, laptop on battery ~2.4 tasks/s), so the scheduler gets ~90% of it.
-Lending only 2 laptop slots adds ~10% capacity, which the desktop's waves of
-10 tasks absorb, so pooling only pays off once a device lends a meaningful
-share of its cores. Pooling also pays off more for longer tasks, since the
-fixed per-task overhead (~0.1–0.3s) matters less.
+The laptop's tasks slow from ~2.3s to ~3.1s when it runs 8 at once, so the
+best possible result for the second setup is about 1.45× (desktop ~5.9
+tasks/s, laptop ~2.6 tasks/s); the pool gets ~90% of it, and the laptop does
+a third of the work. Lending only 2 laptop slots adds ~15% capacity, so
+pooling pays off once a device lends a meaningful share of its cores. It also
+pays off more for longer tasks, since the fixed cost of a run (~1s to start)
+and of each task (~0.1s) matters less.
 
 **Windows Smart App Control:** when it is on, Windows may refuse to start
 unsigned programs that were just shipped to a device ("An Application Control
@@ -255,5 +261,5 @@ releases with `git tag -s` so the tag is signed.
 |---|---|---|
 | **1. Remote run** ✅ | `pool run` on a named device, streaming, cancel/timeout, allow list | Unit + end-to-end tests (`go test ./...`), live run over Tailscale |
 | **2. Scheduling** ✅ | Pick the least-loaded device automatically; laptops lend CPU only on AC power; pause when CPU is busy | Unit tests for ranking, power and load parsing, and agent policy; live: laptop on battery paused itself, busy desktop → job auto-placed on laptop |
-| **3. Fan-out** ✅ | `pool map` across devices; ship and collect files; content cache; retry on device failure; backup copies of slow tasks | Unit tests for scheduling, retries, backups, cache, path safety; live benchmark 1.28× (90% of the possible 1.41× for these two machines) |
+| **3. Fan-out** ✅ | `pool map` across devices; ship and collect files; content cache; retry on device failure; backup copies of slow tasks | Unit tests for scheduling, retries, backups, cache, path safety; live benchmark 1.31× (90% of the possible 1.45× for these two machines) |
 | **4. Hardening** ✅ | Runs in the background and restarts itself; survives sleep and network changes; jobs die with the agent; `pool run` moves past unreachable devices; dashboard | Unit tests for job history, unreachable agents, log rotation, health check, dashboard state and Host check, task argument quoting; live on both devices: agents killed → both back within 56s; agent killed mid-job → job process gone |

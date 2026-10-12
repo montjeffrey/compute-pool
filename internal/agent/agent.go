@@ -161,11 +161,23 @@ func New(cfg Config) (*Agent, error) {
 	return a, nil
 }
 
-// missingFiles lists hashes a request wants from the cache that it lacks.
-func (a *Agent) missingFiles(files []proto.InputFile) []string {
+// missingFiles lists hashes a request wants from the cache that it lacks. The
+// job's program is linked rather than copied, so its entry is also checked
+// against its hash, and one that has changed counts as missing.
+func (a *Agent) missingFiles(req proto.RunRequest) []string {
+	program := shippedProgram(req)
 	var missing []string
-	for _, f := range files {
-		if f.Cached && (a.cache == nil || !a.cache.has(f.SHA256)) {
+	for _, f := range req.Files {
+		if !f.Cached {
+			continue
+		}
+		ok := a.cache != nil && a.cache.has(f.SHA256)
+		if ok && program != "" {
+			if rel, err := proto.CleanRelPath(f.Path); err == nil && rel == program {
+				ok = a.cache.verify(f.SHA256)
+			}
+		}
+		if !ok {
 			missing = append(missing, f.SHA256)
 		}
 	}
@@ -332,7 +344,7 @@ func (a *Agent) handleRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("bad request: more than %d files", maxFilesPerRequest), http.StatusBadRequest)
 		return
 	}
-	if missing := a.missingFiles(req.Files); len(missing) > 0 {
+	if missing := a.missingFiles(req); len(missing) > 0 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusPreconditionFailed)
 		_ = json.NewEncoder(w).Encode(proto.MissingFiles{Missing: missing})

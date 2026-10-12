@@ -15,7 +15,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/montjeffrey/compute-pool/internal/proto"
@@ -37,42 +36,19 @@ var ErrBusy = errors.New("agent not accepting jobs")
 type Client struct {
 	HTTP *http.Client
 	Port int
-
-	mu    sync.Mutex
-	known map[string]map[string]bool // host -> content hashes it has cached
 }
 
-func (c *Client) isKnown(host, hash string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.known[host][hash]
-}
-
-func (c *Client) markKnown(host string, files []proto.InputFile) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.known == nil {
-		c.known = make(map[string]map[string]bool)
-	}
-	if c.known[host] == nil {
-		c.known[host] = make(map[string]bool)
-	}
-	for _, f := range files {
-		if f.SHA256 != "" {
-			c.known[host][f.SHA256] = true
-		}
-	}
-}
-
-// wireRequest replaces the data of files host already has with a cache
-// reference, except for hashes listed in resend.
-func (c *Client) wireRequest(host string, req proto.RunRequest, resend map[string]bool) proto.RunRequest {
+// wireRequest replaces the data of every file that has a hash with a cache
+// reference, except for hashes listed in resend. Agents keep their cache
+// across runs, so asking first usually saves the upload; an agent without
+// the file answers 412 and the file is sent in full.
+func (c *Client) wireRequest(req proto.RunRequest, resend map[string]bool) proto.RunRequest {
 	if len(req.Files) == 0 {
 		return req
 	}
 	files := make([]proto.InputFile, len(req.Files))
 	for i, f := range req.Files {
-		if f.SHA256 != "" && !resend[f.SHA256] && c.isKnown(host, f.SHA256) {
+		if f.SHA256 != "" && !resend[f.SHA256] {
 			f = proto.InputFile{Path: f.Path, SHA256: f.SHA256, Cached: true}
 		}
 		files[i] = f
@@ -191,7 +167,7 @@ func (c *Client) Run(ctx context.Context, host string, req proto.RunRequest, out
 	if len(req.Collect) > 0 && out.Dir == "" {
 		return Result{}, errors.New("collecting files needs an output directory")
 	}
-	resp, err := c.post(ctx, host, c.wireRequest(host, req, nil))
+	resp, err := c.post(ctx, host, c.wireRequest(req, nil))
 	if err != nil {
 		return Result{}, err
 	}
@@ -207,7 +183,7 @@ func (c *Client) Run(ctx context.Context, host string, req proto.RunRequest, out
 		for _, h := range mf.Missing {
 			resend[h] = true
 		}
-		if resp, err = c.post(ctx, host, c.wireRequest(host, req, resend)); err != nil {
+		if resp, err = c.post(ctx, host, c.wireRequest(req, resend)); err != nil {
 			return Result{}, err
 		}
 	}
@@ -215,7 +191,6 @@ func (c *Client) Run(ctx context.Context, host string, req proto.RunRequest, out
 	if err := checkStatus(resp); err != nil {
 		return Result{}, err
 	}
-	c.markKnown(host, req.Files)
 
 	var res Result
 	files := newFileSink(out.Dir)

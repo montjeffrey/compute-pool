@@ -61,7 +61,7 @@ func (c *fileCache) put(hash string, data []byte) error {
 	if hex.EncodeToString(sum[:]) != hash {
 		return fmt.Errorf("content does not match sha256 %s", hash)
 	}
-	if c.has(hash) {
+	if c.verify(hash) {
 		return nil
 	}
 	tmp, err := os.CreateTemp(c.dir, "incoming-")
@@ -85,8 +85,53 @@ func (c *fileCache) put(hash string, data []byte) error {
 	return nil
 }
 
-// copyTo copies a cached file to dst. Jobs get a copy, never a link, so a
-// job that modifies its input cannot corrupt the cache.
+// verify reports whether the entry for hash exists and still matches it. An
+// entry that no longer matches is removed, so the client is asked to resend it.
+func (c *fileCache) verify(hash string) bool {
+	if !validHash(hash) {
+		return false
+	}
+	f, err := os.Open(c.path(hash))
+	if err != nil {
+		return false
+	}
+	h := sha256.New()
+	_, err = io.Copy(h, f)
+	f.Close()
+	if err != nil {
+		return false
+	}
+	if hex.EncodeToString(h.Sum(nil)) == hash {
+		return true
+	}
+	os.Remove(c.path(hash))
+	return false
+}
+
+// linkTo gives dst the cached file as a hard link, or a copy where links
+// aren't supported. Only a job's program is linked: Windows Defender scans
+// every new executable file before it runs (about half a second each on a
+// laptop) but not another link to a file it has already scanned. A running
+// program can't be written to on Windows or Linux, and missingFiles verifies
+// the entry before every use, so a job that altered its program can't affect
+// the next one.
+func (c *fileCache) linkTo(hash, dst string) error {
+	if !validHash(hash) {
+		return fmt.Errorf("invalid sha256 %q", hash)
+	}
+	src := c.path(hash)
+	_ = os.Chmod(src, 0o700) // links share permissions, and programs must be executable
+	if err := os.Link(src, dst); err != nil {
+		return c.copyTo(hash, dst)
+	}
+	now := time.Now()
+	_ = os.Chtimes(src, now, now) // recently used entries survive eviction
+	return nil
+}
+
+// copyTo copies a cached file to dst. Input files get a copy, never a link,
+// so a job that modifies its input cannot corrupt the cache or the input of
+// another job running at the same time.
 func (c *fileCache) copyTo(hash, dst string) error {
 	if !validHash(hash) {
 		return fmt.Errorf("invalid sha256 %q", hash)

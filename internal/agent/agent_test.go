@@ -60,6 +60,12 @@ func TestHelperProcess(t *testing.T) {
 		_ = os.WriteFile(filepath.Join("out", "sub", "nested.txt"), []byte("nested"), 0o644)
 		_ = os.WriteFile(filepath.Join("out", "empty.txt"), nil, 0o644)
 		_ = os.WriteFile("not-collected.txt", []byte("x"), 0o644)
+	case "sameas":
+		// Whether this program is the same file as $SAME_AS (a hard link to it).
+		self, err1 := os.Executable()
+		a, err2 := os.Stat(self)
+		b, err3 := os.Stat(os.Getenv("SAME_AS"))
+		fmt.Print(err1 == nil && err2 == nil && err3 == nil && os.SameFile(a, b))
 	case "sleep":
 		time.Sleep(time.Minute)
 	case "spawn":
@@ -393,6 +399,67 @@ func sha(data []byte) string {
 	return hex.EncodeToString(s[:])
 }
 
+// shippedHelper returns a request that ships this test binary, with its hash,
+// and runs it by name in the given helper mode.
+func shippedHelper(t *testing.T, mode string) (proto.RunRequest, []byte) {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "helper"
+	if filepath.Ext(exe) == ".exe" {
+		name += ".exe"
+	}
+	return proto.RunRequest{
+		Argv:  []string{name, "-test.run=TestHelperProcess", "--", mode},
+		Env:   map[string]string{"GO_WANT_HELPER_PROCESS": "1"},
+		Files: []proto.InputFile{{Path: name, Data: data, SHA256: sha(data)}},
+	}, data
+}
+
+func TestShippedProgramLinkedFromCache(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	req, data := shippedHelper(t, "sameas")
+	req.Env["SAME_AS"] = filepath.Join(h.cacheDir, sha(data))
+	// The first run uploads the program; the second takes it from the cache.
+	// Both must run the cached file itself, not a fresh copy, which Windows
+	// Defender would scan again before letting it start.
+	for _, label := range []string{"first run", "second run"} {
+		res, out, errOut, err := h.run(t, context.Background(), req)
+		if err != nil || res.ExitCode != 0 || out != "true" {
+			t.Errorf("%s: res=%+v err=%v stdout=%q stderr=%q", label, res, err, out, errOut)
+		}
+	}
+}
+
+func TestChangedCachedProgramIsResent(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	req, data := shippedHelper(t, "echo")
+	check := func(label string) {
+		t.Helper()
+		res, out, errOut, err := h.run(t, context.Background(), req)
+		if err != nil || res.ExitCode != 3 || out != "hello from job\n" {
+			t.Fatalf("%s: res=%+v err=%v stdout=%q stderr=%q", label, res, err, out, errOut)
+		}
+	}
+	check("first run")
+	// Jobs run a link to the cache entry, so a changed entry must be caught
+	// before the next job runs it.
+	entry := filepath.Join(h.cacheDir, sha(data))
+	if err := os.WriteFile(entry, []byte("not the program"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	check("run after the cached program changed")
+	if got, _ := os.ReadFile(entry); !bytes.Equal(got, data) {
+		t.Errorf("cache entry was not restored (%d bytes, want %d)", len(got), len(data))
+	}
+}
+
 func TestFileCache(t *testing.T) {
 	h := newHarness(t, 1, allowAll{})
 	content := []byte("cached input")
@@ -440,6 +507,34 @@ func TestFileCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("run after cache loss")
+}
+
+func TestNewClientUsesAgentCache(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	content := []byte("cached input")
+	hash := sha(content)
+	req := helperRequest(t, "files", nil)
+	req.Files = []proto.InputFile{{Path: "data/in.txt", Data: content, SHA256: hash}}
+	req.Collect = []string{"out/result.txt"}
+	if res, _, errOut, err := h.run(t, context.Background(), req); err != nil || res.ExitCode != 0 {
+		t.Fatalf("first run: res=%+v err=%v stderr=%q", res, err, errOut)
+	}
+
+	// A new client (a new pool command) must ask for the agent's copy rather
+	// than upload the file again. Mark the cached copy to see which one ran.
+	if err := os.WriteFile(filepath.Join(h.cacheDir, hash), []byte("from cache"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fresh := client.New()
+	fresh.Port = h.client.Port
+	var out, errb bytes.Buffer
+	res, err := fresh.Run(context.Background(), h.host, req, client.Output{Stdout: &out, Stderr: &errb, Dir: h.outDir})
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("new client: res=%+v err=%v stderr=%q", res, err, errb.String())
+	}
+	if got, _ := os.ReadFile(filepath.Join(h.outDir, "out", "result.txt")); string(got) != "FROM CACHE" {
+		t.Errorf("new client uploaded the file again: result = %q", got)
+	}
 }
 
 func TestFileCacheRejectsWrongHash(t *testing.T) {
