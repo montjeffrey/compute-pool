@@ -13,6 +13,9 @@ func containChildren() error { return nil }
 
 func hideConsole() {}
 
+// isElevated matters only to pool install, which is Windows-only.
+func isElevated() bool { return false }
+
 func openBrowser(url string) error {
 	opener := "xdg-open"
 	if runtime.GOOS == "darwin" {

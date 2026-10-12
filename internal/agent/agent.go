@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/montjeffrey/compute-pool/internal/hwinfo"
 	"github.com/montjeffrey/compute-pool/internal/proto"
 	"github.com/montjeffrey/compute-pool/internal/sysinfo"
 )
@@ -45,6 +46,11 @@ type Config struct {
 	// disables caching. CacheBytes caps its size (default 2 GiB).
 	CacheDir   string
 	CacheBytes int64
+
+	// Specs and Capacity, if set, are reported in Info so other devices can
+	// weigh this one (see pool setup).
+	Specs    *hwinfo.Specs
+	Capacity *proto.Capacity
 }
 
 // Agent serves the pool HTTP API.
@@ -293,6 +299,8 @@ func (a *Agent) info() proto.Info {
 		HasBattery:  s.Power.HasBattery,
 		OnBattery:   s.Power.OnBattery,
 		BatteryPct:  s.Power.BatteryPct,
+		Specs:       a.cfg.Specs,
+		Capacity:    a.cfg.Capacity,
 	}
 	info.Reason = a.refusal(s)
 	if info.Reason == "" && info.Running >= info.MaxJobs {

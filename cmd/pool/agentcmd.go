@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/montjeffrey/compute-pool/internal/agent"
+	"github.com/montjeffrey/compute-pool/internal/capacity"
+	"github.com/montjeffrey/compute-pool/internal/hwinfo"
 	"github.com/montjeffrey/compute-pool/internal/proto"
 	"github.com/montjeffrey/compute-pool/internal/sysinfo"
 	"github.com/montjeffrey/compute-pool/internal/tsutil"
@@ -84,6 +86,17 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 	sampler := sysinfo.NewSampler()
 	go sampler.Run(ctx, 2*time.Second)
 
+	// Other devices use these to weigh this one; pool setup saves the
+	// measurement, and an agent without one simply doesn't report it.
+	specs := hwinfo.Detect()
+	measured, err := capacity.Load(capacity.DefaultPath())
+	if err != nil {
+		measured = nil
+		if !errors.Is(err, os.ErrNotExist) {
+			logger.Printf("not reporting measured speed: %v", err)
+		}
+	}
+
 	var a *agent.Agent
 	for {
 		// At boot or after waking, Tailscale may not be connected yet; wait
@@ -112,6 +125,8 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 				BusyThreshold: *f.busyThreshold,
 				CacheDir:      cacheDir,
 				CacheBytes:    *f.cacheMB << 20,
+				Specs:         &specs,
+				Capacity:      measured,
 			})
 			if err != nil {
 				return err

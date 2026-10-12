@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/montjeffrey/compute-pool/internal/hwinfo"
 )
 
 // DefaultPort is the TCP port agents listen on.
@@ -164,6 +166,65 @@ type Info struct {
 	// Reason says why (on battery, CPU busy, all slots in use).
 	Accepting bool   `json:"accepting"`
 	Reason    string `json:"reason,omitempty"`
+
+	// Specs describes the hardware; Capacity is its speed as measured by
+	// pool setup. Both are absent on older agents, and Capacity also until
+	// pool setup has run on the device.
+	Specs    *hwinfo.Specs `json:"specs,omitempty"`
+	Capacity *Capacity     `json:"capacity,omitempty"`
+}
+
+// Capacity is a device's measured speed: how much work it gets through with
+// different numbers of jobs running at once.
+type Capacity struct {
+	// Kernel names the workload that was timed. Rates are only comparable
+	// between devices measured with the same kernel.
+	Kernel     string    `json:"kernel"`
+	MeasuredAt time.Time `json:"measured_at"`
+	OnBattery  bool      `json:"on_battery,omitempty"`
+	// Levels lists throughput by number of parallel jobs, fewest first.
+	Levels []Level `json:"levels"`
+}
+
+// Level is the throughput, in work units per second for all jobs together,
+// with Jobs jobs running at once.
+type Level struct {
+	Jobs int     `json:"jobs"`
+	Rate float64 `json:"rate"`
+}
+
+// RateAt estimates the throughput with jobs running at once, interpolating
+// between measured levels and holding the last level's rate beyond it. It
+// returns 0 if nothing was measured.
+func (c *Capacity) RateAt(jobs int) float64 {
+	if c == nil || len(c.Levels) == 0 || jobs <= 0 {
+		return 0
+	}
+	prev := Level{}
+	for _, l := range c.Levels {
+		if jobs <= l.Jobs {
+			if l.Jobs == prev.Jobs {
+				return l.Rate
+			}
+			f := float64(jobs-prev.Jobs) / float64(l.Jobs-prev.Jobs)
+			return prev.Rate + f*(l.Rate-prev.Rate)
+		}
+		prev = l
+	}
+	return prev.Rate
+}
+
+// Peak returns the highest measured throughput and the jobs that reached it.
+func (c *Capacity) Peak() Level {
+	var best Level
+	if c != nil {
+		for _, l := range c.Levels {
+			if l.Rate > best.Rate {
+				best = l
+			}
+		}
+	}
+	return best
 }
 
 // JobRecord describes a job an agent is running or recently ran.

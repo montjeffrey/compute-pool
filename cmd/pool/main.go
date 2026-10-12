@@ -29,7 +29,8 @@ import (
 const usage = `pool shares CPU between your own devices over Tailscale.
 
 Usage:
-  pool setup [flags]            describe this device's hardware
+  pool setup [flags]            measure this device and recommend (and apply)
+                                settings for its agent
   pool agent [flags]            lend this device's CPU to allowed devices
   pool nodes [flags]            list tailnet devices running an agent
   pool run [--node N] [flags] -- command [args...]
@@ -61,7 +62,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	code := 0
 	switch args[0] {
 	case "setup":
-		err = cmdSetup(ctx, args[1:], stdout, stderr)
+		err = cmdSetup(ctx, args[1:], os.Stdin, stdout, stderr)
 	case "agent":
 		err = cmdAgent(ctx, args[1:], stderr)
 	case "nodes":

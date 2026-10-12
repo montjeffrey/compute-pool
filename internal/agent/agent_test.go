@@ -22,6 +22,7 @@ import (
 
 	"github.com/montjeffrey/compute-pool/internal/agent"
 	"github.com/montjeffrey/compute-pool/internal/client"
+	"github.com/montjeffrey/compute-pool/internal/hwinfo"
 	"github.com/montjeffrey/compute-pool/internal/proto"
 	"github.com/montjeffrey/compute-pool/internal/sysinfo"
 )
@@ -762,6 +763,27 @@ func TestBusyThreshold(t *testing.T) {
 	info, _ = h.client.Info(context.Background(), h.host)
 	if !info.Accepting || info.Reason != "" {
 		t.Errorf("info after load dropped = %+v", info)
+	}
+}
+
+func TestInfoReportsSpecsAndCapacity(t *testing.T) {
+	specs := hwinfo.Specs{CPUModel: "Example CPU", LogicalCPUs: 16, PhysicalCores: 8, MemoryMB: 16384}
+	measured := proto.Capacity{Kernel: "test", Levels: []proto.Level{{Jobs: 1, Rate: 90}, {Jobs: 8, Rate: 600}}}
+	h := newHarnessWith(t, 1, allowAll{}, func(c *agent.Config) { c.Specs, c.Capacity = &specs, &measured })
+	info, err := h.client.Info(context.Background(), h.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Specs == nil || *info.Specs != specs {
+		t.Errorf("specs = %+v", info.Specs)
+	}
+	if info.Capacity == nil || info.Capacity.RateAt(8) != 600 {
+		t.Errorf("capacity = %+v", info.Capacity)
+	}
+	// An agent configured without them leaves them out.
+	plain := newHarness(t, 1, allowAll{})
+	if info, err := plain.client.Info(context.Background(), plain.host); err != nil || info.Specs != nil || info.Capacity != nil {
+		t.Errorf("unconfigured agent: specs %v, capacity %v, err %v", info.Specs, info.Capacity, err)
 	}
 }
 
