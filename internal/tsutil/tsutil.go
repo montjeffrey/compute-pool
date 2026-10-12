@@ -206,7 +206,7 @@ func run(ctx context.Context, args ...string) ([]byte, error) {
 		return nil, err
 	}
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := command(ctx, bin, args...)
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
