@@ -8,10 +8,38 @@ import (
 )
 
 var (
-	kernel32                 = syscall.NewLazyDLL("kernel32.dll")
-	procGetSystemTimes       = kernel32.NewProc("GetSystemTimes")
-	procGetSystemPowerStatus = kernel32.NewProc("GetSystemPowerStatus")
+	kernel32                      = syscall.NewLazyDLL("kernel32.dll")
+	procGetSystemTimes            = kernel32.NewProc("GetSystemTimes")
+	procGetSystemPowerStatus      = kernel32.NewProc("GetSystemPowerStatus")
+	procQueryInformationJobObject = kernel32.NewProc("QueryInformationJobObject")
 )
+
+// jobBasicAccounting mirrors JOBOBJECT_BASIC_ACCOUNTING_INFORMATION.
+type jobBasicAccounting struct {
+	TotalUserTime             int64
+	TotalKernelTime           int64
+	ThisPeriodTotalUserTime   int64
+	ThisPeriodTotalKernelTime int64
+	TotalPageFaultCount       uint32
+	TotalProcesses            uint32
+	ActiveProcesses           uint32
+	TotalTerminatedProcesses  uint32
+}
+
+const jobObjectBasicAccountingInformation = 1
+
+// JobCPUTimes returns the CPU time used so far by every process that has
+// been in the job object h, in GetSystemTimes' units (100 ns), so it can be
+// compared with system-wide use.
+func JobCPUTimes(h uintptr) (uint64, error) {
+	var info jobBasicAccounting
+	r, _, err := procQueryInformationJobObject.Call(h, jobObjectBasicAccountingInformation,
+		uintptr(unsafe.Pointer(&info)), unsafe.Sizeof(info), 0)
+	if r == 0 {
+		return 0, err
+	}
+	return uint64(info.TotalUserTime + info.TotalKernelTime), nil
+}
 
 func filetime(ft syscall.Filetime) uint64 {
 	return uint64(ft.HighDateTime)<<32 | uint64(ft.LowDateTime)

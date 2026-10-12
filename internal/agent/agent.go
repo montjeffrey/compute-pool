@@ -37,9 +37,10 @@ type Config struct {
 	Probe func() sysinfo.Snapshot
 	// LendOnBattery lets a laptop accept jobs while unplugged.
 	LendOnBattery bool
-	// BusyThreshold refuses new jobs while system CPU use is at or above
-	// this percentage, whether the load comes from the owner or from jobs
-	// already running. Zero disables the check.
+	// BusyThreshold refuses new jobs while CPU use by other programs (the
+	// owner's own work) is at or above this percentage. The agent's own jobs
+	// don't count when the Probe can tell them apart (Snapshot.OwnBusyPct);
+	// otherwise all CPU use does. Zero disables the check.
 	BusyThreshold float64
 
 	// CacheDir keeps shipped files by content hash between jobs; empty
@@ -260,7 +261,7 @@ func (a *Agent) authenticate(next http.Handler) http.Handler {
 
 func (a *Agent) snapshot() sysinfo.Snapshot {
 	if a.cfg.Probe == nil {
-		return sysinfo.Snapshot{CPUBusyPct: -1, Power: sysinfo.Power{BatteryPct: -1}}
+		return sysinfo.Snapshot{CPUBusyPct: -1, OwnBusyPct: -1, Power: sysinfo.Power{BatteryPct: -1}}
 	}
 	return a.cfg.Probe()
 }
@@ -272,8 +273,11 @@ func (a *Agent) refusal(s sysinfo.Snapshot) string {
 	if s.Power.OnBattery && !a.cfg.LendOnBattery {
 		return "on battery"
 	}
-	if a.cfg.BusyThreshold > 0 && s.CPUBusyPct >= a.cfg.BusyThreshold {
-		return fmt.Sprintf("cpu busy (%.0f%%)", s.CPUBusyPct)
+	// Only other programs count: the agent's own jobs are expected to use
+	// the CPU, and counting them would make it refuse work whenever it lends
+	// most of the device, then accept again as jobs drain, over and over.
+	if other := s.OtherBusyPct(); a.cfg.BusyThreshold > 0 && other >= a.cfg.BusyThreshold {
+		return fmt.Sprintf("cpu busy (%.0f%%)", other)
 	}
 	return ""
 }

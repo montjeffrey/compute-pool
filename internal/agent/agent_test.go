@@ -764,6 +764,20 @@ func TestBusyThreshold(t *testing.T) {
 	if !info.Accepting || info.Reason != "" {
 		t.Errorf("info after load dropped = %+v", info)
 	}
+
+	// Load from the agent's own jobs doesn't count: 92% busy, 75% of it
+	// ours, leaves 17% from other programs.
+	probe.snap.CPUBusyPct, probe.snap.OwnBusyPct = 92, 75
+	info, _ = h.client.Info(context.Background(), h.host)
+	if !info.Accepting {
+		t.Errorf("refused because of its own jobs: %+v", info)
+	}
+	// But other programs past the threshold still pause it.
+	probe.snap.CPUBusyPct, probe.snap.OwnBusyPct = 100, 15
+	info, _ = h.client.Info(context.Background(), h.host)
+	if info.Accepting || !strings.Contains(info.Reason, "cpu busy (85%)") {
+		t.Errorf("not paused by other programs: %+v", info)
+	}
 }
 
 func TestInfoReportsSpecsAndCapacity(t *testing.T) {

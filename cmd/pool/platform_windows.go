@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"syscall"
 	"unsafe"
+
+	"github.com/montjeffrey/compute-pool/internal/sysinfo"
 )
 
 var (
@@ -74,7 +76,22 @@ func containChildren() error {
 	}
 	// The handle is deliberately never closed: the OS closes it when the
 	// agent exits, and that is what ends the jobs.
+	agentJob = h
 	return nil
+}
+
+// agentJob is the job object holding the agent and its jobs, once
+// containChildren has created it.
+var agentJob uintptr
+
+// ownCPUReader reads the CPU time of the agent and its jobs from the job
+// object's accounting, or returns nil if there is no job object.
+func ownCPUReader() func() (uint64, error) {
+	if agentJob == 0 {
+		return nil
+	}
+	h := agentJob
+	return func() (uint64, error) { return sysinfo.JobCPUTimes(h) }
 }
 
 // hideConsole detaches from the console window the startup task creates.

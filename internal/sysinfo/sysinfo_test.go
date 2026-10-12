@@ -63,6 +63,80 @@ func TestSamplerSmoothsAndReportsUnknownFirst(t *testing.T) {
 	}
 }
 
+func TestSamplerSeparatesOwnUse(t *testing.T) {
+	cpu := []cpuTimes{{idle: 0, total: 0}, {idle: 20, total: 100}, {idle: 30, total: 200}}
+	own := []uint64{1000, 1060, 1130} // 60 then 70 of each 100 units
+	i := 0
+	s := &Sampler{
+		busy:      -1,
+		readCPU:   func() (cpuTimes, error) { return cpu[i], nil },
+		readPower: func() (Power, error) { return Power{}, nil },
+	}
+	s.SetOwnReader(func() (uint64, error) { r := own[i]; i++; return r, nil })
+	s.sample()
+	if snap := s.Snapshot(); snap.OwnBusyPct != -1 || snap.OtherBusyPct() != -1 {
+		t.Fatalf("before a full interval: %+v", snap)
+	}
+	s.sample() // 80% busy, 60% ours
+	if snap := s.Snapshot(); snap.CPUBusyPct != 80 || snap.OwnBusyPct != 60 || snap.OtherBusyPct() != 20 {
+		t.Errorf("first interval: %+v, other %v", snap, snap.OtherBusyPct())
+	}
+	s.sample() // 90% busy, 70% ours; smoothed: 85 and 65
+	if snap := s.Snapshot(); snap.CPUBusyPct != 85 || snap.OwnBusyPct != 65 || snap.OtherBusyPct() != 20 {
+		t.Errorf("second interval: %+v, other %v", snap, snap.OtherBusyPct())
+	}
+}
+
+func TestSamplerOwnUseUnknownCountsEverything(t *testing.T) {
+	cpu := []cpuTimes{{idle: 0, total: 0}, {idle: 20, total: 100}}
+	i := 0
+	s := &Sampler{
+		busy:      -1,
+		readCPU:   func() (cpuTimes, error) { r := cpu[i]; i++; return r, nil },
+		readPower: func() (Power, error) { return Power{}, nil },
+	}
+	s.SetOwnReader(func() (uint64, error) { return 0, errUnsupported })
+	s.sample()
+	s.sample()
+	if snap := s.Snapshot(); snap.CPUBusyPct != 80 || snap.OwnBusyPct != -1 || snap.OtherBusyPct() != 80 {
+		t.Errorf("snapshot = %+v, other %v", snap, snap.OtherBusyPct())
+	}
+	// Our share can't exceed the total, whatever the counters say.
+	if got := (Snapshot{CPUBusyPct: 30, OwnBusyPct: 50}).OtherBusyPct(); got != 0 {
+		t.Errorf("OtherBusyPct with own above total = %v", got)
+	}
+}
+
+func TestParseProcPIDStat(t *testing.T) {
+	line := "4321 (pool (agent) x) S 1 4321 4321 0 -1 4194560 100 0 0 0 250 50 30 20 20 0 9 0 12345 0 0\n"
+	p, err := parseProcPIDStat(line)
+	if err != nil || p.pid != 4321 || p.ppid != 1 || p.cpu != 350 {
+		t.Errorf("parse = %+v, %v", p, err)
+	}
+	for _, bad := range []string{"", "12 no-parens S 1", "x (a) S 1 2 3", "1 (a) S 1 2 3 4 5 6 7 8 9 10 x 1 1 1"} {
+		if _, err := parseProcPIDStat(bad); err == nil {
+			t.Errorf("parseProcPIDStat(%q): no error", bad)
+		}
+	}
+}
+
+func TestTreeCPU(t *testing.T) {
+	procs := []procStat{
+		{pid: 1, ppid: 0, cpu: 1000},  // init: not ours
+		{pid: 10, ppid: 1, cpu: 5},    // the agent
+		{pid: 11, ppid: 10, cpu: 300}, // a job
+		{pid: 12, ppid: 11, cpu: 200}, // its child
+		{pid: 13, ppid: 10, cpu: 100}, // another job
+		{pid: 20, ppid: 1, cpu: 900},  // the owner's program
+	}
+	if got := treeCPU(procs, 10); got != 605 {
+		t.Errorf("treeCPU = %d, want 605", got)
+	}
+	if got := treeCPU(procs, 99); got != 0 {
+		t.Errorf("treeCPU of a missing process = %d", got)
+	}
+}
+
 func TestSamplerPowerErrorMeansUnknown(t *testing.T) {
 	s := &Sampler{
 		busy:      -1,

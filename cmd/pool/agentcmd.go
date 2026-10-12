@@ -84,6 +84,13 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 		cacheDir = filepath.Join(filepath.Dir(filepath.Clean(*f.workDir)), "cache")
 	}
 	sampler := sysinfo.NewSampler()
+	// Telling the agent's own jobs apart from the owner's work keeps the
+	// busy threshold from pausing the agent because of its own jobs.
+	if read := ownCPUReader(); read != nil {
+		sampler.SetOwnReader(read)
+	} else {
+		logger.Printf("warning: can't tell this agent's jobs from other programs; the busy threshold counts both")
+	}
 	go sampler.Run(ctx, 2*time.Second)
 
 	// Other devices use these to weigh this one; pool setup saves the

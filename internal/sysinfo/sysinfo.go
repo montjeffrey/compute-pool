@@ -27,7 +27,20 @@ type Snapshot struct {
 	// CPUBusyPct is system-wide CPU use (0-100) over recent samples, or -1
 	// before the first full interval or on platforms without support.
 	CPUBusyPct float64
+	// OwnBusyPct is the part of CPUBusyPct used by this process and its
+	// descendants (the agent and its jobs), or -1 when unknown.
+	OwnBusyPct float64
 	Power      Power
+}
+
+// OtherBusyPct is CPU use by everything except this process and its
+// descendants: the owner's own work. It is CPUBusyPct when OwnBusyPct is
+// unknown, and -1 when CPU use is unknown.
+func (s Snapshot) OtherBusyPct() float64 {
+	if s.CPUBusyPct < 0 || s.OwnBusyPct < 0 {
+		return s.CPUBusyPct
+	}
+	return max(0, s.CPUBusyPct-s.OwnBusyPct)
 }
 
 // cpuTimes are cumulative counters in arbitrary but consistent units.
@@ -53,12 +66,20 @@ func busyPct(prev, cur cpuTimes) (float64, bool) {
 type Sampler struct {
 	readCPU   func() (cpuTimes, error)
 	readPower func() (Power, error)
+	// readOwn reports the CPU time used by this process and its
+	// descendants, in the same units as readCPU's totals; nil if unknown.
+	readOwn func() (uint64, error)
 
 	mu       sync.Mutex
 	prev     cpuTimes
 	havePrev bool
 	busy     float64
 	power    Power
+
+	prevOwn  uint64
+	haveOwn  bool
+	own      float64
+	ownKnown bool
 }
 
 // NewSampler returns a Sampler for this platform. Call Run to start it.
@@ -66,6 +87,15 @@ func NewSampler() *Sampler {
 	s := &Sampler{readCPU: readCPUTimes, readPower: readPower, busy: -1}
 	s.sample()
 	return s
+}
+
+// SetOwnReader tells the sampler how to read the CPU time used by this
+// process and its descendants, in the units of the system-wide counters
+// (see JobCPUTimes and TreeCPUTimes). Call it before Run.
+func (s *Sampler) SetOwnReader(read func() (uint64, error)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.readOwn, s.haveOwn, s.ownKnown = read, false, false
 }
 
 // Run samples every interval until ctx ends.
@@ -86,11 +116,33 @@ func (s *Sampler) Run(ctx context.Context, interval time.Duration) {
 func (s *Sampler) Snapshot() Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return Snapshot{CPUBusyPct: s.busy, Power: s.power}
+	own := -1.0
+	if s.ownKnown && s.busy >= 0 {
+		own = min(s.own, s.busy)
+	}
+	return Snapshot{CPUBusyPct: s.busy, OwnBusyPct: own, Power: s.power}
+}
+
+// smooth blends a new reading into a running value so one spike doesn't
+// flip the agent between accepting and refusing.
+func smooth(old, cur float64, known bool) float64 {
+	if !known {
+		return cur
+	}
+	return 0.5*old + 0.5*cur
 }
 
 func (s *Sampler) sample() {
+	s.mu.Lock()
+	readOwn := s.readOwn
+	s.mu.Unlock()
+	// Read the counters back to back so they cover the same interval.
 	cur, cpuErr := s.readCPU()
+	var own uint64
+	ownErr := errUnsupported
+	if readOwn != nil {
+		own, ownErr = readOwn()
+	}
 	pw, pwErr := s.readPower()
 
 	s.mu.Lock()
@@ -98,16 +150,20 @@ func (s *Sampler) sample() {
 	if cpuErr == nil {
 		if s.havePrev {
 			if pct, ok := busyPct(s.prev, cur); ok {
-				// Smooth so one spike doesn't flip the agent between accepting
-				// and refusing.
-				if s.busy < 0 {
-					s.busy = pct
-				} else {
-					s.busy = 0.5*s.busy + 0.5*pct
+				s.busy = smooth(s.busy, pct, s.busy >= 0)
+				if ownErr == nil && s.haveOwn && own >= s.prevOwn {
+					ownPct := min(100, 100*float64(own-s.prevOwn)/float64(cur.total-s.prev.total))
+					s.own = smooth(s.own, ownPct, s.ownKnown)
+					s.ownKnown = true
 				}
 			}
 		}
 		s.prev, s.havePrev = cur, true
+	}
+	if ownErr == nil {
+		s.prevOwn, s.haveOwn = own, true
+	} else {
+		s.haveOwn, s.ownKnown = false, false
 	}
 	if pwErr == nil {
 		s.power = pw
@@ -145,6 +201,72 @@ func parseProcStat(data string) (cpuTimes, error) {
 		return t, nil
 	}
 	return cpuTimes{}, errors.New("no cpu line in /proc/stat")
+}
+
+// procStat is the part of a Linux /proc/<pid>/stat line that matters here.
+type procStat struct {
+	pid, ppid int
+	// cpu is the process's user and system time plus that of its children
+	// it has waited for, in clock ticks (the units of /proc/stat).
+	cpu uint64
+}
+
+// parseProcPIDStat reads a /proc/<pid>/stat line. The command name is in
+// parentheses and may itself contain spaces and parentheses, so fields are
+// counted from the last ')'.
+func parseProcPIDStat(line string) (procStat, error) {
+	open, end := strings.IndexByte(line, '('), strings.LastIndexByte(line, ')')
+	if open < 0 || end < open {
+		return procStat{}, errors.New("malformed stat line")
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(line[:open]))
+	if err != nil {
+		return procStat{}, err
+	}
+	// After the name: state ppid pgrp session tty tpgid flags minflt
+	// cminflt majflt cmajflt utime stime cutime cstime ...
+	f := strings.Fields(line[end+1:])
+	if len(f) < 15 {
+		return procStat{}, errors.New("short stat line")
+	}
+	ppid, err := strconv.Atoi(f[1])
+	if err != nil {
+		return procStat{}, err
+	}
+	var cpu uint64
+	for _, s := range f[11:15] {
+		v, err := strconv.ParseUint(s, 10, 64)
+		if err != nil {
+			return procStat{}, err
+		}
+		cpu += v
+	}
+	return procStat{pid: pid, ppid: ppid, cpu: cpu}, nil
+}
+
+// treeCPU sums the CPU time of root and every live descendant. Descendants
+// that have exited are already counted in their parent's waited-for time.
+func treeCPU(procs []procStat, root int) uint64 {
+	children := map[int][]int{}
+	cpu := map[int]uint64{}
+	for _, p := range procs {
+		children[p.ppid] = append(children[p.ppid], p.pid)
+		cpu[p.pid] = p.cpu
+	}
+	var total uint64
+	seen := map[int]bool{}
+	stack := []int{root}
+	for len(stack) > 0 {
+		pid := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		total += cpu[pid]
+		stack = append(stack, children[pid]...)
+	}
+	return total
 }
 
 // readSysfsPower inspects Linux /sys/class/power_supply (root is the

@@ -12,6 +12,9 @@ func readCPUTimes() (cpuTimes, error) {
 	return cpuTimes{}, errUnsupported
 }
 
+// TreeCPUTimes is unknown here, like CPU load itself.
+func TreeCPUTimes() (uint64, error) { return 0, errUnsupported }
+
 func readPower() (Power, error) {
 	if runtime.GOOS != "darwin" {
 		return Power{}, errUnsupported
