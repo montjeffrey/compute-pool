@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -53,11 +54,37 @@ func taskCommandLine(agentArgs []string, logPath string) string {
 // The scripts read their inputs from environment variables so no value is
 // ever spliced into PowerShell source. Progress output is silenced because
 // a non-interactive PowerShell serializes it onto stderr.
-const stopScript = `
+//
+// Agents are found by executable name and an "agent" argument, not by Path:
+// from a non-elevated shell both Path and CommandLine read empty for the S4U
+// agent, so a same-named process whose details can't be read is taken to be
+// the agent. POOL_SELF, the process running install or uninstall, is never
+// matched, so running them from the installed copy doesn't kill the installer.
+const agentProcsScript = `
 $ProgressPreference = 'SilentlyContinue'
-$t = Get-ScheduledTask -TaskName $env:POOL_TASK -ErrorAction SilentlyContinue
-if ($t) { Stop-ScheduledTask -TaskName $env:POOL_TASK -ErrorAction SilentlyContinue }
-Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $env:POOL_EXE } | Stop-Process -Force -ErrorAction SilentlyContinue
+function Get-PoolAgents {
+  $name = Split-Path -Leaf $env:POOL_EXE
+  @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.Name -eq $name -and $_.ProcessId -ne [int]$env:POOL_SELF -and
+    ($_.CommandLine -match '\sagent(\s|$)' -or (-not $_.CommandLine -and -not $_.ExecutablePath))
+  })
+}
+function Stop-PoolAgents {
+  $t = Get-ScheduledTask -TaskName $env:POOL_TASK -ErrorAction SilentlyContinue
+  if ($t) { Stop-ScheduledTask -TaskName $env:POOL_TASK -ErrorAction SilentlyContinue }
+  Get-PoolAgents | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  # Wait until the executable is released and the task no longer counts as
+  # running, or a following Start-ScheduledTask would be ignored.
+  $deadline = (Get-Date).AddSeconds(10)
+  while ((Get-Date) -lt $deadline -and ((Get-PoolAgents).Count -gt 0 -or
+    ($t -and (Get-ScheduledTask -TaskName $env:POOL_TASK -ErrorAction SilentlyContinue).State -eq 'Running'))) {
+    Start-Sleep -Milliseconds 200
+  }
+}
+`
+
+const stopScript = agentProcsScript + `
+Stop-PoolAgents
 `
 
 // installScript prefers an S4U task (runs at boot, before anyone logs in,
@@ -69,9 +96,12 @@ Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $env:POOL
 // launch, not a program that later exits or is killed, so a trigger that
 // fires every minute acts as the watchdog: with MultipleInstances IgnoreNew
 // it does nothing while the agent runs and relaunches it if it has died.
-const installScript = `
+// That same watchdog can relaunch the old agent, with its old arguments,
+// while the executable is replaced; IgnoreNew would then ignore the final
+// Start-ScheduledTask. So the agent is stopped again after registering, and
+// the script reports whether one came back with the new arguments.
+const installScript = agentProcsScript + `
 $ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
 # USERDOMAIN reads "WORKGROUP" in SSH sessions; the token's name is reliable.
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $action = New-ScheduledTaskAction -Execute $env:POOL_EXE -Argument $env:POOL_ARGS -WorkingDirectory $env:POOL_DIR
@@ -88,8 +118,20 @@ try {
   $triggers = @((New-ScheduledTaskTrigger -AtLogOn -User $user), $watchdog)
   Register-ScheduledTask -TaskName $env:POOL_TASK -Action $action -Trigger $triggers -Settings $settings -Principal $principal -Force | Out-Null
 }
+Stop-PoolAgents
 Start-ScheduledTask -TaskName $env:POOL_TASK
 "$mode as $user"
+$state = 'not running'
+$deadline = (Get-Date).AddSeconds(15)
+do {
+  Start-Sleep -Milliseconds 500
+  $procs = Get-PoolAgents
+  if ($procs | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($env:POOL_ARGS) }) { $state = 'running'; break }
+  elseif ($procs | Where-Object { -not $_.CommandLine }) { $state = 'unverified' }
+  elseif ($procs) { $state = 'stale' }
+  else { $state = 'not running' }
+} while ((Get-Date) -lt $deadline)
+$state
 `
 
 const uninstallScript = stopScript + `
@@ -161,7 +203,7 @@ func cmdInstall(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	if err != nil {
 		return err
 	}
-	env := map[string]string{"POOL_TASK": taskName, "POOL_EXE": p.exe, "POOL_DIR": p.base}
+	env := map[string]string{"POOL_TASK": taskName, "POOL_EXE": p.exe, "POOL_DIR": p.base, "POOL_SELF": strconv.Itoa(os.Getpid())}
 
 	// Stop any running copy first so its executable can be replaced.
 	if _, err := runPowerShell(ctx, stopScript, env); err != nil {
@@ -178,17 +220,42 @@ func cmdInstall(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	}
 
 	env["POOL_ARGS"] = taskCommandLine(args, p.log)
-	mode, err := runPowerShell(ctx, installScript, env)
+	out, err := runPowerShell(ctx, installScript, env)
 	if err != nil {
 		return fmt.Errorf("register startup task: %w", err)
 	}
-	if !strings.HasPrefix(mode, "at ") {
-		return fmt.Errorf("register startup task: unexpected output %q", mode)
+	mode, state, err := parseInstallOutput(out)
+	if err != nil {
+		return fmt.Errorf("register startup task: %w", err)
+	}
+	switch state {
+	case "stale":
+		return fmt.Errorf("startup task registered (%s), but the running agent still has its old flags; run pool install again", mode)
+	case "not running":
+		return fmt.Errorf("startup task registered (%s), but the agent is not running; see %s", mode, p.log)
 	}
 	fmt.Fprintf(stdout, "Installed: the agent now runs %s.\n", mode)
 	fmt.Fprintf(stdout, "  program: %s\n  log:     %s\n", p.exe, p.log)
+	if state == "unverified" {
+		fmt.Fprintf(stdout, "The agent is running, but its flags can't be read from this shell; an elevated one can check them.\n")
+	}
 	fmt.Fprintf(stdout, "It restarts within a minute if it stops. Remove it with: pool uninstall\n")
 	return nil
+}
+
+// parseInstallOutput splits installScript's output into the task's run mode
+// and whether an agent came up with the new arguments.
+func parseInstallOutput(out string) (mode, state string, err error) {
+	mode, state, _ = strings.Cut(out, "\n")
+	mode, state = strings.TrimSpace(mode), strings.TrimSpace(state)
+	if !strings.HasPrefix(mode, "at ") {
+		return "", "", fmt.Errorf("unexpected output %q", out)
+	}
+	switch state {
+	case "running", "unverified", "stale", "not running":
+		return mode, state, nil
+	}
+	return "", "", fmt.Errorf("unexpected output %q", out)
 }
 
 func cmdUninstall(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -199,7 +266,7 @@ func cmdUninstall(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if err != nil {
 		return err
 	}
-	out, err := runPowerShell(ctx, uninstallScript, map[string]string{"POOL_TASK": taskName, "POOL_EXE": p.exe})
+	out, err := runPowerShell(ctx, uninstallScript, map[string]string{"POOL_TASK": taskName, "POOL_EXE": p.exe, "POOL_SELF": strconv.Itoa(os.Getpid())})
 	if err != nil {
 		return err
 	}
