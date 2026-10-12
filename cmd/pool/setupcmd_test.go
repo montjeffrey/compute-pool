@@ -63,7 +63,9 @@ func TestSetupWithoutMeasurementDeclined(t *testing.T) {
 		t.Fatalf("setup: %v (%s)", err, errb.String())
 	}
 	got := out.String()
-	for _, w := range []string{"No saved measurement", "Recommended settings:", "not measured", "allowed devices  desktop"} {
+	// The max jobs reason depends on this machine's CPU count, so only the
+	// setting itself is checked.
+	for _, w := range []string{"No saved measurement", "Recommended settings:", "  max jobs ", "allowed devices  desktop"} {
 		if !strings.Contains(got, w) {
 			t.Errorf("output lacks %q:\n%s", w, got)
 		}
