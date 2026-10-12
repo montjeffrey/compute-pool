@@ -87,21 +87,28 @@ collected files; 16 MiB of buffered output each for stdout and stderr in
 
 ### Measured speedup
 
-`scripts/bench.ps1` runs the same CPU-bound tasks (`cmd/poolbench`, ~1.75s each
-on the desktop) on one device and on all devices:
+`scripts/bench.ps1` runs the same CPU-bound tasks (`cmd/poolbench`, ~1.7s each
+on the desktop) on one device and on all devices. Here a desktop lending 10
+slots is paired with a laptop:
 
-| Setup | 1 device | 2 devices | Speedup |
-|---|---|---|---|
-| desktop (10 slots) + laptop lending **2** slots, 48 tasks | 10.5s | 9.5s | 1.10× |
-| desktop (10 slots) + laptop lending **8** slots, 96 tasks | 18.5s | 14.1s | **1.31×** |
+| Laptop lends | Power | Tasks | Desktop alone | Both | Speedup | Laptop's time per task |
+|---|---|---|---|---|---|---|
+| **8** slots | plugged in | 96 | 18.5s | 14.1s | **1.31×** | ~3.1s |
+| **8** slots | battery (`--lend-on-battery`) | 96 | 19.0s | 16.7s | 1.14× | ~3.4s |
+| **2** slots | plugged in | 48 | 10.1–10.5s | 9.5–9.7s | 1.05–1.10× | ~2.3s |
+| **2** slots | battery (`--lend-on-battery`) | 48 | 9.7s | 9.9s | 0.98× | ~2.75s |
 
-The laptop's tasks slow from ~2.3s to ~3.1s when it runs 8 at once, so the
-best possible result for the second setup is about 1.45× (desktop ~5.9
+With 8 slots plugged in, the best possible result is about 1.45× (desktop ~5.9
 tasks/s, laptop ~2.6 tasks/s); the pool gets ~90% of it, and the laptop does
-a third of the work. Lending only 2 laptop slots adds ~15% capacity, so
-pooling pays off once a device lends a meaningful share of its cores. It also
-pays off more for longer tasks, since the fixed cost of a run (~1s to start)
-and of each task (~0.1s) matters less.
+a third of the work. The laptop's tasks slow down when it runs many at once or
+runs on battery, which is most of the difference between the rows.
+
+- **Lend a meaningful share of the cores.** Two laptop slots add ~15%
+  capacity, and the slower last tasks on the laptop can cancel that out.
+- **Pooling a laptop on battery helps little**, which is why agents pause on
+  battery unless started with `--lend-on-battery`.
+- **Longer tasks gain more**, since the fixed cost of a run (~1s to start) and
+  of each task (~0.1s) matters less.
 
 **Windows Smart App Control:** when it is on, Windows may refuse to start
 unsigned programs that were just shipped to a device ("An Application Control
