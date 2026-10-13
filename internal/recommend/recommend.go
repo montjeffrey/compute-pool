@@ -51,6 +51,9 @@ type Result struct {
 	MaxJobs       int     `json:"max_jobs"`
 	LendOnBattery bool    `json:"lend_on_battery"`
 	BusyThreshold float64 `json:"busy_threshold"`
+	// JobMemoryMB is the memory planned per job, passed on to the agent as
+	// its guess until it has measured jobs.
+	JobMemoryMB int64 `json:"job_memory_mb"`
 	// Speedup is the measured throughput at MaxJobs relative to one job, or
 	// 0 when unmeasured.
 	Speedup  float64   `json:"speedup,omitempty"`
@@ -71,7 +74,7 @@ func Recommend(in Input) Result {
 		jobMem = DefaultJobMemoryMB
 	}
 
-	r := Result{BusyThreshold: DefaultBusyThreshold}
+	r := Result{BusyThreshold: DefaultBusyThreshold, JobMemoryMB: jobMem}
 
 	// Start from what the measurement says the CPU can use well, then apply
 	// the limits that protect the owner and the machine.
@@ -141,6 +144,9 @@ func (r Result) Args(allow []string) []string {
 	}
 	if r.BusyThreshold != DefaultBusyThreshold {
 		args = append(args, "--busy-threshold", fmt.Sprintf("%g", r.BusyThreshold))
+	}
+	if r.JobMemoryMB > 0 && r.JobMemoryMB != DefaultJobMemoryMB {
+		args = append(args, "--job-memory", fmt.Sprint(r.JobMemoryMB))
 	}
 	return args
 }

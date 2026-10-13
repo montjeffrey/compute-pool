@@ -162,8 +162,21 @@ type Info struct {
 	OnBattery  bool    `json:"on_battery,omitempty"`
 	BatteryPct int     `json:"battery_pct"` // -1 if unknown or no battery
 
+	// JobLimit is how many jobs the agent would run at once right now:
+	// MaxJobs, lowered while other programs use the CPU or free memory is
+	// short, as LimitReason says. Agents before 0.1.5 don't report it, and
+	// it is also absent when the limit is 0 (then Accepting is false).
+	JobLimit    int    `json:"job_limit,omitempty"`
+	LimitReason string `json:"limit_reason,omitempty"`
+	// FreeMemoryMB is memory available to new programs (absent if unknown).
+	// JobMemoryMB is what the agent plans for each job: the largest recent
+	// job's peak if JobMemoryMeasured, else its configured guess.
+	FreeMemoryMB      int64 `json:"free_memory_mb,omitempty"`
+	JobMemoryMB       int64 `json:"job_memory_mb,omitempty"`
+	JobMemoryMeasured bool  `json:"job_memory_measured,omitempty"`
+
 	// Accepting reports whether a job sent now would be taken. When false,
-	// Reason says why (on battery, CPU busy, all slots in use).
+	// Reason says why (on battery, CPU busy, at its job limit).
 	Accepting bool   `json:"accepting"`
 	Reason    string `json:"reason,omitempty"`
 

@@ -15,6 +15,9 @@ func readCPUTimes() (cpuTimes, error) {
 // TreeCPUTimes is unknown here, like CPU load itself.
 func TreeCPUTimes() (uint64, error) { return 0, errUnsupported }
 
+// Free memory is left unknown here, so it never limits jobs.
+func readMemory() (Memory, error) { return Memory{}, errUnsupported }
+
 func readPower() (Power, error) {
 	if runtime.GOOS != "darwin" {
 		return Power{}, errUnsupported

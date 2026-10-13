@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -67,6 +68,13 @@ func TestHelperProcess(t *testing.T) {
 		a, err2 := os.Stat(self)
 		b, err3 := os.Stat(os.Getenv("SAME_AS"))
 		fmt.Print(err1 == nil && err2 == nil && err3 == nil && os.SameFile(a, b))
+	case "alloc":
+		// Use 200 MB, touching every page so it is really committed.
+		b := make([]byte, 200<<20)
+		for i := 0; i < len(b); i += 4096 {
+			b[i] = 1
+		}
+		runtime.KeepAlive(b)
 	case "sleep":
 		time.Sleep(time.Minute)
 	case "spawn":
@@ -798,6 +806,45 @@ func TestInfoReportsSpecsAndCapacity(t *testing.T) {
 	plain := newHarness(t, 1, allowAll{})
 	if info, err := plain.client.Info(context.Background(), plain.host); err != nil || info.Specs != nil || info.Capacity != nil {
 		t.Errorf("unconfigured agent: specs %v, capacity %v, err %v", info.Specs, info.Capacity, err)
+	}
+}
+
+func TestInfoReportsLiveLimit(t *testing.T) {
+	// 2 GB free of 16 GB keeps 1.6 GB for the owner: no room for a 512 MB job.
+	probe := &fixedProbe{sysinfo.Snapshot{CPUBusyPct: -1, OwnBusyPct: -1, Power: sysinfo.Power{BatteryPct: -1},
+		Memory: sysinfo.Memory{Known: true, TotalMB: 16384, FreeMB: 2048}}}
+	h := newHarnessWith(t, 4, allowAll{}, func(c *agent.Config) { c.Probe = probe.get })
+	info, err := h.client.Info(context.Background(), h.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Accepting || info.JobLimit != 0 || info.FreeMemoryMB != 2048 || info.JobMemoryMB != 512 || info.JobMemoryMeasured ||
+		!strings.HasPrefix(info.Reason, "taking no jobs for now: 2.0 GB of memory free") || !strings.Contains(info.LimitReason, "memory") {
+		t.Errorf("short of memory: %+v", info)
+	}
+	if _, _, _, err := h.run(t, context.Background(), helperRequest(t, "echo", nil)); !errors.Is(err, client.ErrBusy) {
+		t.Errorf("run while short of memory: err = %v, want ErrBusy", err)
+	}
+
+	probe.snap.Memory.FreeMB = 8192 // the owner closed something
+	info, _ = h.client.Info(context.Background(), h.host)
+	if !info.Accepting || info.JobLimit != 4 || info.LimitReason != "" {
+		t.Errorf("with memory free: %+v", info)
+	}
+}
+
+func TestJobMemoryIsMeasured(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	if res, _, stderr, err := h.run(t, context.Background(), helperRequest(t, "alloc", nil)); err != nil || res.ExitCode != 0 {
+		t.Fatalf("alloc job: res=%+v err=%v stderr=%s", res, err, stderr)
+	}
+	info, err := h.client.Info(context.Background(), h.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The job used 200 MB on top of the test binary itself.
+	if !info.JobMemoryMeasured || info.JobMemoryMB < 200 || info.JobMemoryMB > 1024 {
+		t.Errorf("job memory = %d MB (measured %v), want 200-1024", info.JobMemoryMB, info.JobMemoryMeasured)
 	}
 }
 

@@ -40,6 +40,14 @@ func readCPUTimes() (cpuTimes, error) {
 	return parseProcStat(string(b))
 }
 
+func readMemory() (Memory, error) {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return Memory{}, err
+	}
+	return parseMemInfo(string(b))
+}
+
 func readPower() (Power, error) {
 	return readSysfsPower("/sys/class/power_supply")
 }

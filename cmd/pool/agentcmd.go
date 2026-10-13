@@ -36,6 +36,7 @@ type agentFlags struct {
 	lendOnBattery *bool
 	busyThreshold *float64
 	cacheMB       *int64
+	jobMemory     *int64
 	logFile       *string
 	hideConsole   *bool
 }
@@ -52,6 +53,7 @@ func newAgentFlags(name string, stderr io.Writer) (*flag.FlagSet, *agentFlags) {
 		lendOnBattery: fs.Bool("lend-on-battery", false, "accept jobs while this device runs on battery"),
 		busyThreshold: fs.Float64("busy-threshold", 80, "refuse new jobs while CPU use is at or above this percent (0 = never)"),
 		cacheMB:       fs.Int64("cache-mb", 2048, "disk space for caching shipped files between jobs (0 = no cache)"),
+		jobMemory:     fs.Int64("job-memory", agent.DefaultJobMemoryMB, "memory in MB to assume each job needs until jobs have been measured"),
 		logFile:       fs.String("log-file", "", "append the agent's log to this file instead of stderr"),
 		hideConsole:   fs.Bool("hide-console", false, "detach from the console window (used by the startup task)"),
 	}
@@ -132,6 +134,7 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 				BusyThreshold: *f.busyThreshold,
 				CacheDir:      cacheDir,
 				CacheBytes:    *f.cacheMB << 20,
+				JobMemoryMB:   *f.jobMemory,
 				Specs:         &specs,
 				Capacity:      measured,
 			})
@@ -143,6 +146,10 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 				proto.Version, st.Self.Name, st.SelfLogin, strings.Join(auth.Allowed(), ", "), *f.maxJobs)
 			logger.Printf("policy: lend on battery=%v; refuse new jobs at >= %.0f%% CPU; power now: %s",
 				*f.lendOnBattery, *f.busyThreshold, describePower(pw.HasBattery, pw.OnBattery, pw.BatteryPct))
+			if m := sampler.Snapshot().Memory; m.Known {
+				logger.Printf("memory: %.1f of %.1f GB free; planning %d MB per job until jobs are measured; fewer jobs while other programs use the CPU or memory runs short",
+					float64(m.FreeMB)/1024, float64(m.TotalMB)/1024, *f.jobMemory)
+			}
 		}
 
 		addr, boundIP := *f.listen, ""

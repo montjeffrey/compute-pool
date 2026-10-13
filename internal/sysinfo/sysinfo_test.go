@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -236,6 +237,39 @@ func TestParsePmset(t *testing.T) {
 	}
 }
 
+func TestParseMemInfo(t *testing.T) {
+	data := "MemTotal:       16303428 kB\nMemFree:          812344 kB\nMemAvailable:    9437184 kB\nBuffers: 1 kB\n"
+	m, err := parseMemInfo(data)
+	if err != nil || m != (Memory{Known: true, TotalMB: 15921, FreeMB: 9216}) {
+		t.Errorf("parse = %+v, %v", m, err)
+	}
+	// Kernels before 3.14 have no MemAvailable; don't guess from MemFree.
+	if _, err := parseMemInfo("MemTotal: 1000 kB\nMemFree: 500 kB\n"); err == nil {
+		t.Error("no error without MemAvailable")
+	}
+}
+
+func TestSamplerReportsMemory(t *testing.T) {
+	free := int64(4000)
+	s := &Sampler{
+		busy:      -1,
+		readCPU:   func() (cpuTimes, error) { return cpuTimes{}, errUnsupported },
+		readPower: func() (Power, error) { return Power{}, nil },
+		readMem:   func() (Memory, error) { return Memory{Known: true, TotalMB: 8000, FreeMB: free}, nil },
+	}
+	s.sample()
+	free = 1500 // not smoothed: the latest reading counts
+	s.sample()
+	if m := s.Snapshot().Memory; !m.Known || m.FreeMB != 1500 || m.TotalMB != 8000 {
+		t.Errorf("memory = %+v", m)
+	}
+	s.readMem = func() (Memory, error) { return Memory{}, errUnsupported }
+	s.sample()
+	if m := s.Snapshot().Memory; m.Known {
+		t.Errorf("after a failed read memory = %+v, want unknown", m)
+	}
+}
+
 func TestRealSamplerDoesNotFail(t *testing.T) {
 	// Smoke test against this machine: values may be unknown but must be sane.
 	s := NewSampler()
@@ -246,5 +280,11 @@ func TestRealSamplerDoesNotFail(t *testing.T) {
 	}
 	if snap.Power.BatteryPct < -1 || snap.Power.BatteryPct > 100 {
 		t.Errorf("BatteryPct = %v", snap.Power.BatteryPct)
+	}
+	if m := snap.Memory; m.Known && (m.TotalMB <= 0 || m.FreeMB < 0 || m.FreeMB > m.TotalMB) {
+		t.Errorf("Memory = %+v", m)
+	}
+	if (runtime.GOOS == "windows" || runtime.GOOS == "linux") && !snap.Memory.Known {
+		t.Error("memory unknown on a platform that supports it")
 	}
 }

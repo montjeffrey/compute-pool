@@ -1,5 +1,5 @@
-// Package sysinfo measures how busy a device is and whether it is running on
-// battery, so agents can decide whether to accept work.
+// Package sysinfo measures how busy a device is, how much memory is free and
+// whether it is running on battery, so agents can decide how much work to take.
 package sysinfo
 
 import (
@@ -22,6 +22,16 @@ type Power struct {
 	BatteryPct int // -1 when unknown
 }
 
+// Memory describes physical memory.
+type Memory struct {
+	Known   bool // false when the platform gave no answer
+	TotalMB int64
+	// FreeMB is memory available to new programs without swapping: free
+	// plus reclaimable cache (Windows' available memory, Linux's
+	// MemAvailable).
+	FreeMB int64
+}
+
 // Snapshot is the latest measurement.
 type Snapshot struct {
 	// CPUBusyPct is system-wide CPU use (0-100) over recent samples, or -1
@@ -31,6 +41,7 @@ type Snapshot struct {
 	// descendants (the agent and its jobs), or -1 when unknown.
 	OwnBusyPct float64
 	Power      Power
+	Memory     Memory
 }
 
 // OtherBusyPct is CPU use by everything except this process and its
@@ -66,6 +77,7 @@ func busyPct(prev, cur cpuTimes) (float64, bool) {
 type Sampler struct {
 	readCPU   func() (cpuTimes, error)
 	readPower func() (Power, error)
+	readMem   func() (Memory, error) // nil: memory is unknown
 	// readOwn reports the CPU time used by this process and its
 	// descendants, in the same units as readCPU's totals; nil if unknown.
 	readOwn func() (uint64, error)
@@ -75,6 +87,7 @@ type Sampler struct {
 	havePrev bool
 	busy     float64
 	power    Power
+	mem      Memory
 
 	prevOwn  uint64
 	haveOwn  bool
@@ -84,7 +97,7 @@ type Sampler struct {
 
 // NewSampler returns a Sampler for this platform. Call Run to start it.
 func NewSampler() *Sampler {
-	s := &Sampler{readCPU: readCPUTimes, readPower: readPower, busy: -1}
+	s := &Sampler{readCPU: readCPUTimes, readPower: readPower, readMem: readMemory, busy: -1}
 	s.sample()
 	return s
 }
@@ -120,7 +133,7 @@ func (s *Sampler) Snapshot() Snapshot {
 	if s.ownKnown && s.busy >= 0 {
 		own = min(s.own, s.busy)
 	}
-	return Snapshot{CPUBusyPct: s.busy, OwnBusyPct: own, Power: s.power}
+	return Snapshot{CPUBusyPct: s.busy, OwnBusyPct: own, Power: s.power, Memory: s.mem}
 }
 
 // smooth blends a new reading into a running value so one spike doesn't
@@ -144,6 +157,12 @@ func (s *Sampler) sample() {
 		own, ownErr = readOwn()
 	}
 	pw, pwErr := s.readPower()
+	var mem Memory
+	if s.readMem != nil {
+		if m, err := s.readMem(); err == nil {
+			mem = m
+		}
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -170,6 +189,9 @@ func (s *Sampler) sample() {
 	} else {
 		s.power = Power{BatteryPct: -1}
 	}
+	// Memory isn't smoothed: running out of it is what matters, and the
+	// latest reading is the best guess at what's left.
+	s.mem = mem
 }
 
 var errUnsupported = errors.New("not supported on this platform")
@@ -201,6 +223,33 @@ func parseProcStat(data string) (cpuTimes, error) {
 		return t, nil
 	}
 	return cpuTimes{}, errors.New("no cpu line in /proc/stat")
+}
+
+// parseMemInfo reads total and available memory from Linux's /proc/meminfo.
+func parseMemInfo(data string) (Memory, error) {
+	m := Memory{TotalMB: -1, FreeMB: -1}
+	sc := bufio.NewScanner(strings.NewReader(data))
+	for sc.Scan() {
+		f := strings.Fields(sc.Text())
+		if len(f) < 2 {
+			continue
+		}
+		kb, err := strconv.ParseInt(f[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch f[0] {
+		case "MemTotal:":
+			m.TotalMB = kb / 1024
+		case "MemAvailable:":
+			m.FreeMB = kb / 1024
+		}
+	}
+	if m.TotalMB < 0 || m.FreeMB < 0 {
+		return Memory{}, errors.New("no MemTotal or MemAvailable in /proc/meminfo")
+	}
+	m.Known = true
+	return m, nil
 }
 
 // procStat is the part of a Linux /proc/<pid>/stat line that matters here.

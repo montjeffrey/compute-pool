@@ -26,14 +26,17 @@ import (
 
 // Config configures an Agent.
 type Config struct {
-	NodeName string     // this device's short tailnet name
-	MaxJobs  int        // concurrent jobs; further requests get 503
-	WorkDir  string     // parent of each job's scratch directory
-	Auth     Authorizer // required
-	Logger   *log.Logger
+	NodeName string // this device's short tailnet name
+	// MaxJobs is the most jobs run at once. The live limit is lower while
+	// other programs use the CPU or memory is short; requests beyond it get
+	// 503 (see limit.go).
+	MaxJobs int
+	WorkDir string     // parent of each job's scratch directory
+	Auth    Authorizer // required
+	Logger  *log.Logger
 
-	// Probe reports current CPU load and power state. If nil, both are
-	// treated as unknown and never cause a refusal.
+	// Probe reports current CPU load, free memory and power state. If nil,
+	// all are treated as unknown and never cause a refusal.
 	Probe func() sysinfo.Snapshot
 	// LendOnBattery lets a laptop accept jobs while unplugged.
 	LendOnBattery bool
@@ -42,6 +45,9 @@ type Config struct {
 	// don't count when the Probe can tell them apart (Snapshot.OwnBusyPct);
 	// otherwise all CPU use does. Zero disables the check.
 	BusyThreshold float64
+	// JobMemoryMB is the memory each job is assumed to need until the agent
+	// has measured finished jobs (default DefaultJobMemoryMB).
+	JobMemoryMB int64
 
 	// CacheDir keeps shipped files by content hash between jobs; empty
 	// disables caching. CacheBytes caps its size (default 2 GiB).
@@ -58,7 +64,8 @@ type Config struct {
 type Agent struct {
 	cfg     Config
 	cache   *fileCache // nil when caching is off
-	slots   chan struct{}
+	cpus    int
+	mem     memEstimate
 	running atomic.Int32
 	seq     atomic.Uint64
 	started time.Time
@@ -66,6 +73,11 @@ type Agent struct {
 	histMu  sync.Mutex
 	active  map[string]*proto.JobRecord
 	history []proto.JobRecord // finished jobs, oldest first, at most historySize
+
+	admitMu   sync.Mutex
+	admitted  map[uint64]time.Time // job slots taken, with when
+	ticket    uint64
+	lastLimit int // for logging changes
 
 	hostsMu      sync.RWMutex
 	allowedHosts map[string]bool // empty: any Host header
@@ -149,11 +161,17 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = log.New(os.Stderr, "", log.LstdFlags)
 	}
+	if cfg.JobMemoryMB <= 0 {
+		cfg.JobMemoryMB = DefaultJobMemoryMB
+	}
 	a := &Agent{
-		cfg:     cfg,
-		slots:   make(chan struct{}, cfg.MaxJobs),
-		started: time.Now(),
-		active:  make(map[string]*proto.JobRecord),
+		cfg:       cfg,
+		cpus:      runtime.NumCPU(),
+		mem:       memEstimate{def: cfg.JobMemoryMB},
+		started:   time.Now(),
+		active:    make(map[string]*proto.JobRecord),
+		admitted:  make(map[uint64]time.Time),
+		lastLimit: -1,
 	}
 	if cfg.CacheDir != "" {
 		if cfg.CacheBytes <= 0 {
@@ -266,9 +284,8 @@ func (a *Agent) snapshot() sysinfo.Snapshot {
 	return a.cfg.Probe()
 }
 
-// refusal returns why a new job would be refused right now, or "" if it
-// would be accepted. Slot availability is checked separately, atomically,
-// when a job actually arrives.
+// refusal returns why the agent takes no jobs at all right now, or "". The
+// live job limit is checked separately, atomically, when a job arrives.
 func (a *Agent) refusal(s sysinfo.Snapshot) string {
 	if s.Power.OnBattery && !a.cfg.LendOnBattery {
 		return "on battery"
@@ -306,9 +323,15 @@ func (a *Agent) info() proto.Info {
 		Specs:       a.cfg.Specs,
 		Capacity:    a.cfg.Capacity,
 	}
+	st := a.slots(s)
+	info.JobLimit, info.LimitReason = st.limit, st.why
+	info.JobMemoryMB, info.JobMemoryMeasured = st.jobMemMB, st.measured
+	if s.Memory.Known {
+		info.FreeMemoryMB = s.Memory.FreeMB
+	}
 	info.Reason = a.refusal(s)
-	if info.Reason == "" && info.Running >= info.MaxJobs {
-		info.Reason = fmt.Sprintf("all %d job slots in use", info.MaxJobs)
+	if info.Reason == "" && st.admitted >= st.limit {
+		info.Reason = fullReason(st.limit, st.why)
 	}
 	info.Accepting = info.Reason == ""
 	return info
@@ -331,17 +354,17 @@ func (a *Agent) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 	// Refuse before reading the body, so busy agents don't buffer uploads
 	// they will reject, and at most MaxJobs bodies are in memory at once.
-	if reason := a.refusal(a.snapshot()); reason != "" {
+	s := a.snapshot()
+	if reason := a.refusal(s); reason != "" {
 		http.Error(w, reason, http.StatusServiceUnavailable)
 		return
 	}
-	select {
-	case a.slots <- struct{}{}:
-		defer func() { <-a.slots }()
-	default:
-		http.Error(w, fmt.Sprintf("all %d job slots in use", a.cfg.MaxJobs), http.StatusServiceUnavailable)
+	release, reason := a.admit(s)
+	if release == nil {
+		http.Error(w, reason, http.StatusServiceUnavailable)
 		return
 	}
+	defer release()
 
 	var req proto.RunRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, proto.MaxRequestBytes)).Decode(&req); err != nil {
