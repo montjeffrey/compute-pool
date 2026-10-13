@@ -77,6 +77,7 @@ type limitInput struct {
 	admitted int   // jobs holding a slot, running or starting
 	ramping  int   // those admitted within rampTime
 	jobMemMB int64 // memory to plan for each job
+	measured bool  // jobMemMB comes from finished jobs, not the guess
 }
 
 // jobLimit returns how many jobs, counting those already admitted, the agent
@@ -98,9 +99,14 @@ func jobLimit(in limitInput) (int, string) {
 		reserve := memoryReserveMB(m.TotalMB)
 		left := m.FreeMB - reserve - int64(in.ramping)*in.jobMemMB
 		room := int(math.Floor(float64(left) / float64(in.jobMemMB)))
+		perJob := fmt.Sprintf("about %d MB per job", in.jobMemMB)
+		// A guess that is too high would keep every job out, and with no job
+		// run the agent could never learn better: try one at a time.
+		if !in.measured && in.admitted == 0 && room < 1 && left > 0 {
+			room, perJob = 1, fmt.Sprintf("one job at a time until it learns how much memory jobs need (guessing %d MB)", in.jobMemMB)
+		}
 		if l := in.admitted + room; l < limit {
-			limit, why = l, fmt.Sprintf("%s of memory free, %s kept for you, about %d MB per job",
-				gb(m.FreeMB), gb(reserve), in.jobMemMB)
+			limit, why = l, fmt.Sprintf("%s of memory free, %s kept for you, %s", gb(m.FreeMB), gb(reserve), perJob)
 		}
 	}
 	return max(0, limit), why
@@ -145,6 +151,7 @@ func (a *Agent) slotsLocked(s sysinfo.Snapshot, now time.Time) slotState {
 		admitted: len(a.admitted),
 		ramping:  ramping,
 		jobMemMB: mem,
+		measured: measured,
 	})
 	if limit != a.lastLimit {
 		if why == "" {

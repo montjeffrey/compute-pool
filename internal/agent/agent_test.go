@@ -810,20 +810,36 @@ func TestInfoReportsSpecsAndCapacity(t *testing.T) {
 }
 
 func TestInfoReportsLiveLimit(t *testing.T) {
-	// 2 GB free of 16 GB keeps 1.6 GB for the owner: no room for a 512 MB job.
+	// 1.5 GB free of 16 GB is less than the 1.6 GB kept for the owner.
 	probe := &fixedProbe{sysinfo.Snapshot{CPUBusyPct: -1, OwnBusyPct: -1, Power: sysinfo.Power{BatteryPct: -1},
-		Memory: sysinfo.Memory{Known: true, TotalMB: 16384, FreeMB: 2048}}}
+		Memory: sysinfo.Memory{Known: true, TotalMB: 16384, FreeMB: 1536}}}
 	h := newHarnessWith(t, 4, allowAll{}, func(c *agent.Config) { c.Probe = probe.get })
 	info, err := h.client.Info(context.Background(), h.host)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Accepting || info.JobLimit != 0 || info.FreeMemoryMB != 2048 || info.JobMemoryMB != 512 || info.JobMemoryMeasured ||
-		!strings.HasPrefix(info.Reason, "taking no jobs for now: 2.0 GB of memory free") || !strings.Contains(info.LimitReason, "memory") {
+	if info.Accepting || info.JobLimit != 0 || info.FreeMemoryMB != 1536 || info.JobMemoryMB != 512 || info.JobMemoryMeasured ||
+		!strings.HasPrefix(info.Reason, "taking no jobs for now: 1.5 GB of memory free") || !strings.Contains(info.LimitReason, "memory") {
 		t.Errorf("short of memory: %+v", info)
 	}
 	if _, _, _, err := h.run(t, context.Background(), helperRequest(t, "echo", nil)); !errors.Is(err, client.ErrBusy) {
 		t.Errorf("run while short of memory: err = %v, want ErrBusy", err)
+	}
+
+	// 2 GB free: not enough for the 512 MB guess, so one job runs to learn
+	// what jobs really need.
+	probe.snap.Memory.FreeMB = 2048
+	info, _ = h.client.Info(context.Background(), h.host)
+	if !info.Accepting || info.JobLimit != 1 || !strings.Contains(info.LimitReason, "one job at a time") {
+		t.Errorf("probing: %+v", info)
+	}
+	if res, _, _, err := h.run(t, context.Background(), helperRequest(t, "echo", nil)); err != nil || res.ExitCode != 3 {
+		t.Fatalf("probe job: res=%+v err=%v", res, err)
+	}
+	// The echo job needed far less than 512 MB, so all four slots fit.
+	info, _ = h.client.Info(context.Background(), h.host)
+	if !info.JobMemoryMeasured || info.JobMemoryMB >= 512 || info.JobLimit != 4 || !info.Accepting {
+		t.Errorf("after measuring: %+v", info)
 	}
 
 	probe.snap.Memory.FreeMB = 8192 // the owner closed something
