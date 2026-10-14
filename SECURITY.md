@@ -60,8 +60,9 @@ stderr.
   machine, run the agent under a dedicated low-privilege account.
 - **Job history is visible to allowed devices.** `/v1/jobs` and the dashboard
   show the first 200 characters of each job's command, and the agent logs
-  commands. Pass secrets with `--env`, which is never shown or logged, not as
-  arguments.
+  commands. `/v1/log` serves that log (for `pool report`) to the same allowed
+  devices, which could read it anyway by running a command. Pass secrets with
+  `--env`, which is never shown or logged, not as arguments.
 - **`--shell` with untrusted items is command injection by design.** In
   `pool map`, `{}` is substituted into the command as is.
 - **Retries and backup copies can run a task twice.** Use

@@ -58,6 +58,11 @@ type Config struct {
 	// weigh this one (see pool setup).
 	Specs    *hwinfo.Specs
 	Capacity *proto.Capacity
+
+	// LogPath is the file the Logger writes to, if any. GET /v1/log serves it
+	// (with its rotated predecessor, LogPath+".1") so pool report can assess
+	// this device from another one.
+	LogPath string
 }
 
 // Agent serves the pool HTTP API.
@@ -135,6 +140,51 @@ func (a *Agent) Jobs() proto.Jobs {
 func (a *Agent) handleJobs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(a.Jobs())
+}
+
+// ReadLog reads a rotating log, path.1 then path, older lines first. Both
+// are read whole before returning, so they are held open only briefly (on
+// Windows an open file can't be renamed, which postpones rotation). If the
+// log rotated between the two reads, the read is retried, since the middle
+// would be missing. It returns os.ErrNotExist if neither file exists.
+func ReadLog(path string) ([]byte, error) {
+	for attempt := 0; ; attempt++ {
+		before, statErr := os.Stat(path)
+		old, err := os.ReadFile(path + ".1")
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		cur, err := os.ReadFile(path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		if old == nil && cur == nil {
+			return nil, fmt.Errorf("%s: %w", path, os.ErrNotExist)
+		}
+		// A rotation since the Stat leaves the current file smaller.
+		if statErr == nil && int64(len(cur)) < before.Size() && attempt < 2 {
+			continue
+		}
+		return append(old, cur...), nil
+	}
+}
+
+// handleLog sends the agent's log, older lines first. Devices allowed to
+// call it can already run commands here, so it reveals nothing new to them.
+func (a *Agent) handleLog(w http.ResponseWriter, r *http.Request) {
+	if a.cfg.LogPath == "" {
+		http.Error(w, "this agent's log is not kept in a file (start it with --log-file)", http.StatusNotFound)
+		return
+	}
+	body, err := ReadLog(a.cfg.LogPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		a.cfg.Logger.Printf("read log for %s: %v", r.RemoteAddr, err)
+		http.Error(w, "can't read the log", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_, _ = w.Write(body)
 }
 
 // New validates cfg and prepares the work directory.
@@ -218,6 +268,7 @@ func (a *Agent) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/info", a.handleInfo)
 	mux.HandleFunc("POST /v1/run", a.handleRun)
 	mux.HandleFunc("GET /v1/jobs", a.handleJobs)
+	mux.HandleFunc("GET /v1/log", a.handleLog)
 	return a.authenticate(mux)
 }
 
@@ -262,14 +313,16 @@ func (a *Agent) authenticate(next http.Handler) http.Handler {
 			return
 		}
 		if !a.hostAllowed(r.Host) || fromBrowser(r) {
-			a.cfg.Logger.Printf("refused %s %s from %s: browser-originated request or unexpected Host %q", r.Method, r.URL.Path, host, r.Host)
+			a.cfg.Logger.Printf("refused %s %q from %s: browser-originated request or unexpected Host %q", r.Method, r.URL.Path, host, r.Host)
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
 		id, err := a.cfg.Auth.Authorize(r.Context(), host)
 		if err != nil {
 			// Details stay in the local log; the caller only learns it was refused.
-			a.cfg.Logger.Printf("refused %s %s from %s: %v", r.Method, r.URL.Path, host, err)
+			// %q: the path is the caller's, and a decoded newline in it would
+			// otherwise start a forged log line.
+			a.cfg.Logger.Printf("refused %s %q from %s: %v", r.Method, r.URL.Path, host, err)
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}

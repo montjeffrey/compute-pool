@@ -882,3 +882,74 @@ func TestEmptyCommandRejected(t *testing.T) {
 		t.Errorf("err = %v, want a 400 error", err)
 	}
 }
+
+func TestLogServesRotatedThenCurrent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agent.log")
+	if err := os.WriteFile(path+".1", []byte("old line\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("new line\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := newHarnessWith(t, 1, allowAll{}, func(c *agent.Config) { c.LogPath = path })
+	got, err := h.client.Log(context.Background(), h.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "old line\nnew line\n" {
+		t.Errorf("log = %q", got)
+	}
+}
+
+func TestLogWithoutFile(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	_, err := h.client.Log(context.Background(), h.host)
+	if !errors.Is(err, client.ErrNoLog) {
+		t.Errorf("err = %v, want ErrNoLog", err)
+	}
+}
+
+func TestLogRequiresAuthorization(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agent.log")
+	if err := os.WriteFile(path, []byte("secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := newHarnessWith(t, 1, denyAll{}, func(c *agent.Config) { c.LogPath = path })
+	if _, err := h.client.Log(context.Background(), h.host); !errors.Is(err, client.ErrForbidden) {
+		t.Errorf("err = %v, want ErrForbidden", err)
+	}
+}
+
+func TestReadLogIncludesRotated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.log")
+	if _, err := agent.ReadLog(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("missing log: err = %v", err)
+	}
+	if err := os.WriteFile(path+".1", []byte("a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := agent.ReadLog(path); err != nil || string(b) != "a\n" {
+		t.Errorf("only the rotated file: got %q, %v", b, err)
+	}
+	if err := os.WriteFile(path, []byte("b\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := agent.ReadLog(path); err != nil || string(b) != "a\nb\n" {
+		t.Errorf("got %q, %v", b, err)
+	}
+}
+
+func TestRefusedPathCantForgeLogLines(t *testing.T) {
+	var buf bytes.Buffer
+	h := newHarnessWith(t, 1, denyAll{}, func(c *agent.Config) { c.Logger = log.New(&buf, "", 0) })
+	resp, err := http.Get("http://" + net.JoinHostPort(h.host, strconv.Itoa(h.client.Port)) + "/v1/x%0Ajob%20forged%20done:%20exit=0%20in%201s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if lines := strings.Count(strings.TrimSpace(buf.String()), "\n") + 1; lines != 1 || strings.Contains(buf.String(), "\njob forged") {
+		t.Errorf("log:\n%s", buf.String())
+	}
+}

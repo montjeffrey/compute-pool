@@ -34,6 +34,8 @@ Usage:
   pool agent [flags]            lend this device's CPU to allowed devices
   pool nodes [flags]            list tailnet devices running an agent
   pool advise [flags]           compare every device: capacity, expected speedup, what to change
+  pool report [flags]           assess past use from agent logs: speed by jobs at once,
+                                consistency between runs, slot use, reliability
   pool run [--node N] [flags] -- command [args...]
                                 run a command on the least-loaded device (or on N)
                                 and stream its output
@@ -66,6 +68,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = cmdSetup(ctx, args[1:], os.Stdin, stdout, stderr)
 	case "advise":
 		err = cmdAdvise(ctx, args[1:], stdout, stderr)
+	case "report":
+		err = cmdReport(ctx, args[1:], stdout, stderr)
 	case "agent":
 		err = cmdAgent(ctx, args[1:], stderr)
 	case "nodes":

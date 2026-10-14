@@ -115,6 +115,31 @@ unsigned programs that were just shipped to a device ("An Application Control
 policy has blocked this file"). Shipping scripts to an installed interpreter
 (`--ship job.py -- python job.py`) avoids this.
 
+### Assessing real use (`pool report`)
+
+`pool report` reads every device's agent log (fetched from its agent, or
+`--log FILE` for a copy) and assesses each command that ran at least
+`--min-jobs` times:
+
+1. **Speed by jobs at once**: time per task and throughput at each number of
+   jobs running together, next to what pool setup's measurement predicts.
+2. **Consistency between runs**: how far runs at the same load differ, which is
+   the smallest change a benchmark can claim, and the same by agent version.
+3. **Slot use**: how much of each run the job slots were busy, and how much the
+   slowest task lagged the median.
+4. **Reliability**: how jobs ended, agent restarts, and time spent taking no jobs.
+
+On the desktop above, 4,051 `poolbench` tasks over three days ran at 5.56
+tasks/s with 10 jobs at once and 6.71 with 15, within 0–3% of what pool setup
+predicted. Runs with 10 jobs at once differed by up to ±12%, so gains of a few
+percent, like the 1.05–1.10× rows above, can't be told apart from noise. Slots
+were busy 85% of a run (median).
+
+Agents from 0.1.5 log microseconds and serve their log at `/v1/log`. Older
+logs have whole-second times, which pool report narrows using each job's
+duration; an older agent elsewhere can't serve its log, so copy it and use
+`--log`.
+
 ## How placement works
 
 Every agent samples its CPU load every 2 seconds and checks its power source.
@@ -234,6 +259,7 @@ the agents use.
 | `pool run [--node N] -- cmd args...` | `--node auto` (default) or a device name/IP · `--shell` run via cmd.exe or /bin/sh · `--ship` · `--collect` · `--out pool-out` · `--timeout 10m` · `--env K=V` (repeatable) · `-v` shows where the job went · `--probe-timeout 1s` |
 | `pool map (--range A..B \| --items F \| --inputs GLOB) -- cmd {}` | `--ship` · `--collect` · `--out pool-out` · `--nodes a,b` · `--jobs N` · `--retries 2` · `--speculate` · `--keep-order` · `--shell` · `--timeout` · `--env K=V` · `-v` |
 | `pool nodes` | `--timeout 1s` |
+| `pool report` | `--log FILE` (repeatable; no network) · `--nodes a,b` · `--min-jobs 30` · `--run-gap 2s` · `--json` · `--timeout 1s` |
 | `pool dashboard` | `--open` · `--listen 127.0.0.1:7471` · `--tailnet` · `--allow a,b` |
 | `pool install` / `pool uninstall` | `pool install` takes the same flags as `pool agent` (Windows) |
 

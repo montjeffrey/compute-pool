@@ -67,16 +67,22 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 	if *f.hideConsole {
 		hideConsole()
 	}
-	logOut := stderr
+	logOut, logPath := stderr, ""
 	if *f.logFile != "" {
-		lf, err := newRotatingLog(*f.logFile)
+		abs, err := filepath.Abs(*f.logFile)
+		if err != nil {
+			return err
+		}
+		logPath = abs
+		lf, err := newRotatingLog(logPath)
 		if err != nil {
 			return err
 		}
 		defer lf.Close()
 		logOut = lf
 	}
-	logger := log.New(logOut, "", log.LstdFlags)
+	// Microseconds let pool report tell which jobs overlapped.
+	logger := log.New(logOut, "", log.LstdFlags|log.Lmicroseconds)
 	if err := containChildren(); err != nil {
 		logger.Printf("warning: jobs may outlive the agent if it is killed: %v", err)
 	}
@@ -137,6 +143,7 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 				JobMemoryMB:   *f.jobMemory,
 				Specs:         &specs,
 				Capacity:      measured,
+				LogPath:       logPath,
 			})
 			if err != nil {
 				return err
@@ -327,18 +334,32 @@ func (l *rotatingLog) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.size+int64(len(p)) > maxLogBytes {
-		l.f.Close()
-		_ = os.Remove(l.path + ".1")
-		_ = os.Rename(l.path, l.path+".1")
-		f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-		if err != nil {
+		if err := l.rotate(); err != nil {
 			return 0, err
 		}
-		l.f, l.size = f, 0
 	}
 	n, err := l.f.Write(p)
 	l.size += int64(n)
 	return n, err
+}
+
+// rotate moves the log to path.1 and starts a new one. On Windows the rename
+// fails while another program reads the log (pool report does); the log then
+// keeps growing and rotation is tried again on the next write, rather than
+// emptying the file in place.
+func (l *rotatingLog) rotate() error {
+	l.f.Close()
+	_ = os.Remove(l.path + ".1")
+	renamed := os.Rename(l.path, l.path+".1") == nil
+	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	l.f = f
+	if renamed {
+		l.size = 0
+	}
+	return nil
 }
 
 func (l *rotatingLog) Close() error {
