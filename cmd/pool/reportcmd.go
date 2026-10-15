@@ -34,7 +34,7 @@ func cmdReport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	fs := flag.NewFlagSet("report", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var logs listFlag
-	fs.Var(&logs, "log", "assess this agent log file instead of asking the devices (repeatable)")
+	fs.Var(&logs, "log", "assess this agent log file instead of fetching logs from the devices (repeatable)")
 	nodes := fs.String("nodes", "", "comma-separated devices to assess (default: every device running an agent)")
 	asJSON := fs.Bool("json", false, "print the assessments as JSON")
 	minJobs := fs.Int("min-jobs", 30, "successful jobs a command needs before its speed is assessed")
@@ -62,7 +62,7 @@ func cmdReport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		err  error
 	)
 	if len(logs) > 0 {
-		devs, err = reportFromFiles(logs)
+		devs, err = reportFromFiles(logs, func() map[string]*proto.Capacity { return poolCapacities(ctx, *port, *timeout) })
 	} else {
 		devs, err = reportFromPool(ctx, *nodes, *port, *timeout, stderr)
 	}
@@ -83,10 +83,16 @@ func cmdReport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 }
 
 // reportFromFiles parses log files. This device's pool setup measurement is
-// attached to a log whose device name matches its host name.
-func reportFromFiles(paths []string) ([]report.Device, error) {
+// attached to a log whose device name matches its host name; other logs get
+// their device's measurement from remote, called only if one is needed (it
+// asks the devices' agents, and may return nil).
+func reportFromFiles(paths []string, remote func() map[string]*proto.Capacity) ([]report.Device, error) {
 	host, _ := os.Hostname()
-	var devs []report.Device
+	var (
+		devs     []report.Device
+		measured map[string]*proto.Capacity
+		asked    bool
+	)
 	for _, p := range paths {
 		f, err := os.Open(p)
 		if err != nil {
@@ -103,10 +109,34 @@ func reportFromFiles(paths []string) ([]report.Device, error) {
 		d := report.Device{Log: lg}
 		if strings.EqualFold(lg.Node, host) {
 			d.Capacity, _ = capacity.Load(capacityPath())
+		} else {
+			if !asked {
+				measured, asked = remote(), true
+			}
+			d.Capacity = measured[strings.ToLower(lg.Node)]
 		}
 		devs = append(devs, d)
 	}
 	return devs, nil
+}
+
+// poolCapacities asks every device's agent for its pool setup measurement,
+// keyed by lower-case device name. Without Tailscale it returns nil: the
+// report then simply has no predictions for those devices.
+func poolCapacities(ctx context.Context, port int, timeout time.Duration) map[string]*proto.Capacity {
+	st, err := tsutil.GetStatus(ctx)
+	if err != nil {
+		return nil
+	}
+	c := client.New()
+	c.Port = port
+	out := map[string]*proto.Capacity{}
+	for _, r := range probeAll(ctx, st, c, timeout) {
+		if r.err == nil && r.info.Capacity != nil {
+			out[strings.ToLower(r.peer.Name)] = r.info.Capacity
+		}
+	}
+	return out
 }
 
 // reportFromPool fetches every chosen device's log from its agent. For this

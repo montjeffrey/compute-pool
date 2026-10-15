@@ -154,3 +154,27 @@ func TestFetchDeviceSelfFallsBackToLocalLog(t *testing.T) {
 		t.Errorf("problem = %q", problem)
 	}
 }
+
+func TestReportFromFilesAttachesRemoteMeasurement(t *testing.T) {
+	path := writeSampleLog(t) // node-a, not this device
+	capa := &proto.Capacity{Kernel: "k", Levels: []proto.Level{{Jobs: 1, Rate: 1}, {Jobs: 4, Rate: 4}}}
+	calls := 0
+	devs, err := reportFromFiles([]string{path, path}, func() map[string]*proto.Capacity {
+		calls++
+		return map[string]*proto.Capacity{"node-a": capa}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(devs) != 2 || devs[0].Capacity != capa || devs[1].Capacity != capa {
+		t.Errorf("devices = %+v", devs)
+	}
+	if calls != 1 {
+		t.Errorf("devices were asked %d times, want once", calls)
+	}
+	// Without Tailscale there is simply no measurement.
+	devs, err = reportFromFiles([]string{path}, func() map[string]*proto.Capacity { return nil })
+	if err != nil || devs[0].Capacity != nil {
+		t.Errorf("devices = %+v, %v", devs, err)
+	}
+}

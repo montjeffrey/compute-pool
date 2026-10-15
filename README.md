@@ -259,7 +259,7 @@ the agents use.
 | `pool run [--node N] -- cmd args...` | `--node auto` (default) or a device name/IP · `--shell` run via cmd.exe or /bin/sh · `--ship` · `--collect` · `--out pool-out` · `--timeout 10m` · `--env K=V` (repeatable) · `-v` shows where the job went · `--probe-timeout 1s` |
 | `pool map (--range A..B \| --items F \| --inputs GLOB) -- cmd {}` | `--ship` · `--collect` · `--out pool-out` · `--nodes a,b` · `--jobs N` · `--retries 2` · `--speculate` · `--keep-order` · `--shell` · `--timeout` · `--env K=V` · `-v` |
 | `pool nodes` | `--timeout 1s` |
-| `pool report` | `--log FILE` (repeatable; no network) · `--nodes a,b` · `--min-jobs 30` · `--run-gap 2s` · `--json` · `--timeout 1s` |
+| `pool report` | `--log FILE` (repeatable; logs read from files, measurements still asked of the agents) · `--nodes a,b` · `--min-jobs 30` · `--run-gap 2s` · `--json` · `--timeout 1s` |
 | `pool dashboard` | `--open` · `--listen 127.0.0.1:7471` · `--tailnet` · `--allow a,b` |
 | `pool install` / `pool uninstall` | `pool install` takes the same flags as `pool agent` (Windows) |
 
