@@ -379,3 +379,9 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 		return false
 	}
 }
+
+// defaultAgentLog is the standard place for an agent's log: next to the
+// saved measurement, which on Windows is where pool install logs too.
+func defaultAgentLog() string {
+	return filepath.Join(filepath.Dir(capacity.DefaultPath()), "agent.log")
+}

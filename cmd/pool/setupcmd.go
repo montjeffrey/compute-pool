@@ -140,7 +140,7 @@ func cmdSetup(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 	printRecommendation(stdout, rec, allow, allowWhy)
 
 	if runtime.GOOS != "windows" {
-		fmt.Fprintf(stdout, "\nTo lend this device, run the agent with these settings (pool install is Windows-only so far):\n  pool agent %s\n", strings.Join(installArgs, " "))
+		fmt.Fprintf(stdout, "\nTo lend this device, run the agent with these settings (pool install is Windows-only so far):\n  %s\n", agentCommand(installArgs, defaultAgentLog()))
 		return nil
 	}
 	fmt.Fprintf(stdout, "\nCommand: pool install %s\n", strings.Join(installArgs, " "))
@@ -270,4 +270,18 @@ func plural(n int, word string) string {
 		return "1 " + word
 	}
 	return fmt.Sprintf("%d %ss", n, word)
+}
+
+// agentCommand is the pool agent command line pool setup suggests where
+// pool install isn't available. It logs to a file, as pool install's agent
+// does, so pool report can read the log through the agent.
+func agentCommand(args []string, logPath string) string {
+	parts := append([]string{"pool", "agent"}, args...)
+	parts = append(parts, "--log-file", logPath)
+	for i, p := range parts {
+		if p == "" || strings.ContainsAny(p, " \t'\"$\\") {
+			parts[i] = "'" + strings.ReplaceAll(p, "'", `'\''`) + "'"
+		}
+	}
+	return strings.Join(parts, " ")
 }

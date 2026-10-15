@@ -238,8 +238,12 @@ or after waking). It checks its own listener every 30 seconds and binds again if
 sleep or a network change broke it. On Windows, every job runs inside a job
 object tied to the agent, so if the agent is stopped or crashes, its jobs end too.
 
-On Linux or macOS, run `pool agent --log-file ...` from a systemd user service or
-a launchd agent; `pool install` is Windows-only so far.
+On Linux or macOS, run the `pool agent` command that `pool setup` prints from a
+systemd user service or a launchd agent; `pool install` is Windows-only so far.
+Keep its `--log-file` (`~/.cache/compute-pool/agent.log` on Linux,
+`~/Library/Caches/compute-pool/agent.log` on macOS): `pool report` reads each
+device's log through its agent, and an agent logging to the console has none
+to share.
 
 ### Dashboard (`pool dashboard`)
 

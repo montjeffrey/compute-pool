@@ -132,3 +132,25 @@ func TestPrintDevice(t *testing.T) {
 		}
 	}
 }
+
+func TestAgentCommandLogsToFile(t *testing.T) {
+	got := agentCommand([]string{"--allow", "desktop,laptop", "--max-jobs", "6"}, "/home/me/.cache/compute-pool/agent.log")
+	want := "pool agent --allow desktop,laptop --max-jobs 6 --log-file /home/me/.cache/compute-pool/agent.log"
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+	// Paths with spaces are quoted for a POSIX shell.
+	got = agentCommand(nil, "/Users/Jo Doe/Library/Caches/compute-pool/agent.log")
+	if want := "pool agent --log-file '/Users/Jo Doe/Library/Caches/compute-pool/agent.log'"; got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}
+
+func TestDefaultAgentLogIsNextToMeasurement(t *testing.T) {
+	if filepath.Dir(defaultAgentLog()) != filepath.Dir(capacity.DefaultPath()) {
+		t.Errorf("log %s, measurement %s", defaultAgentLog(), capacity.DefaultPath())
+	}
+	if runtime.GOOS == "windows" && !strings.EqualFold(defaultAgentLog(), installedAgentLog()) {
+		t.Errorf("pool install logs to %s, not the default %s", installedAgentLog(), defaultAgentLog())
+	}
+}
