@@ -176,6 +176,9 @@ layers:
 - Every request is identified with `tailscale whois`. A caller must be **owned by
   the same Tailscale user** *and* be **named in `--allow`**. Addresses outside
   Tailscale's ranges are refused before any lookup. Anything else gets 403.
+  If the lookup fails or is slow (on a busy device), the request is refused
+  with 503 instead, so your own devices try again rather than being told
+  they aren't allowed; successful lookups are cached for a minute.
 - **Web pages can't reach it.** Requests carrying browser headers (`Origin`,
   cross-site `Sec-Fetch-Site`) are refused, jobs must be sent as JSON (which a
   page can't do without a preflight the agent never answers), and the Host header

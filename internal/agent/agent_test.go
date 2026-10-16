@@ -962,3 +962,37 @@ func TestRefusedPathCantForgeLogLines(t *testing.T) {
 		t.Errorf("log:\n%s", buf.String())
 	}
 }
+
+// slowWhois stands for tailscale whois failing or timing out on a busy
+// device: not a refusal, just no answer yet.
+type slowWhois struct{}
+
+func (slowWhois) Authorize(context.Context, string) (agent.Identity, error) {
+	return agent.Identity{}, errors.New("identify 100.64.0.2: tailscale whois --json 100.64.0.2: context canceled")
+}
+
+func TestUnconfirmedCallerIsBusyNotForbidden(t *testing.T) {
+	h := newHarness(t, 1, slowWhois{})
+	_, err := h.client.Info(context.Background(), h.host)
+	if !errors.Is(err, client.ErrBusy) || errors.Is(err, client.ErrForbidden) {
+		t.Fatalf("err = %v, want ErrBusy", err)
+	}
+	if !strings.Contains(err.Error(), "can't confirm who is asking yet") {
+		t.Errorf("err = %v", err)
+	}
+	resp, err := http.Get("http://" + net.JoinHostPort(h.host, strconv.Itoa(h.client.Port)) + "/v1/info")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+		t.Errorf("status %d, Retry-After %q", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+}
+
+func TestDisallowedCallerIsForbidden(t *testing.T) {
+	h := newHarness(t, 1, denyAll{})
+	if _, err := h.client.Info(context.Background(), h.host); !errors.Is(err, client.ErrForbidden) {
+		t.Errorf("err = %v, want ErrForbidden", err)
+	}
+}

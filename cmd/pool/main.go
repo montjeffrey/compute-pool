@@ -194,8 +194,13 @@ func probeAll(ctx context.Context, st tsutil.Status, c *client.Client, timeout t
 }
 
 func probeStatus(err error) string {
-	if errors.Is(err, client.ErrForbidden) {
+	switch {
+	case errors.Is(err, client.ErrForbidden):
 		return "agent refuses this device (add it to --allow)"
+	case errors.Is(err, client.ErrBusy):
+		// An agent answers busy to a status request only when it couldn't
+		// confirm who is asking yet (tailscale slow on a busy device).
+		return "agent busy: " + strings.TrimPrefix(err.Error(), client.ErrBusy.Error()+": ")
 	}
 	return "no agent"
 }

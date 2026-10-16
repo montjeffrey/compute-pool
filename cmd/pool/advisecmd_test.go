@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/montjeffrey/compute-pool/internal/advise"
 	"github.com/montjeffrey/compute-pool/internal/capacity"
+	"github.com/montjeffrey/compute-pool/internal/client"
 	"github.com/montjeffrey/compute-pool/internal/hwinfo"
 	"github.com/montjeffrey/compute-pool/internal/proto"
 	"github.com/montjeffrey/compute-pool/internal/tsutil"
@@ -81,5 +83,21 @@ func TestPrintAdvice(t *testing.T) {
 	printAdvice(&buf, advise.Report{Rows: []advise.Row{{Name: "desktop", Self: true, Status: "ready", Lends: 4}}})
 	if !strings.Contains(buf.String(), "No device has been measured yet") {
 		t.Errorf("unmeasured pool:\n%s", buf.String())
+	}
+}
+
+func TestProbeStatus(t *testing.T) {
+	busy := fmt.Errorf("%w: can't confirm who is asking yet; try again shortly", client.ErrBusy)
+	for _, c := range []struct {
+		err  error
+		want string
+	}{
+		{client.ErrForbidden, "agent refuses this device (add it to --allow)"},
+		{busy, "agent busy: can't confirm who is asking yet; try again shortly"},
+		{errors.New("connection refused"), "no agent"},
+	} {
+		if got := probeStatus(c.err); got != c.want {
+			t.Errorf("probeStatus(%v) = %q, want %q", c.err, got, c.want)
+		}
 	}
 }

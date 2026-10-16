@@ -323,6 +323,15 @@ func (a *Agent) authenticate(next http.Handler) http.Handler {
 			// %q: the path is the caller's, and a decoded newline in it would
 			// otherwise start a forged log line.
 			a.cfg.Logger.Printf("refused %s %q from %s: %v", r.Method, r.URL.Path, host, err)
+			if !errors.Is(err, ErrForbidden) {
+				// The caller couldn't be identified yet (tailscale whois failed
+				// or is slow on a busy device): still refused, but as busy, so
+				// an allowed device retries or moves on instead of being told
+				// it isn't allowed. The lookup carries on and fills the cache.
+				w.Header().Set("Retry-After", "2")
+				http.Error(w, "can't confirm who is asking yet; try again shortly", http.StatusServiceUnavailable)
+				return
+			}
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
