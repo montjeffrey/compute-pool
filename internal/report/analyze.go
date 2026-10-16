@@ -138,7 +138,10 @@ type Reliability struct {
 	Pauses  int           `json:"pauses"`
 	Paused  time.Duration `json:"paused"`
 	Unended int           `json:"unended_pauses"`
-	Refused int           `json:"refused"`
+	// Requests refused: from devices that may not use the agent, and
+	// because the caller's identity couldn't be confirmed (see Log).
+	NotAllowed   int `json:"refused_not_allowed"`
+	Unidentified int `json:"refused_unidentified"`
 }
 
 // Agent exit codes for jobs it ended itself (see pool run).
@@ -179,7 +182,7 @@ func Analyze(devs []Device, opts Options) Report {
 }
 
 func reliability(lg *Log) Reliability {
-	r := Reliability{AgentStarts: lg.Starts, Pauses: len(lg.Pauses), Refused: lg.Refused}
+	r := Reliability{AgentStarts: lg.Starts, Pauses: len(lg.Pauses), NotAllowed: lg.NotAllowed, Unidentified: lg.Unidentified}
 	for _, p := range lg.Pauses {
 		if p.Unended {
 			r.Unended++

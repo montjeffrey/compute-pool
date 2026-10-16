@@ -116,8 +116,11 @@ func writeReliability(w io.Writer, r Reliability) {
 	if r.Unended > 0 {
 		fmt.Fprintf(w, "; was taking no jobs when it stopped %d times", r.Unended)
 	}
-	if r.Refused > 0 {
-		fmt.Fprintf(w, "; refused %d requests from devices that aren't allowed", r.Refused)
+	if r.Unidentified > 0 {
+		fmt.Fprintf(w, "; refused %d requests because it couldn't confirm the caller's identity (tailscale whois failed or was too slow)", r.Unidentified)
+	}
+	if r.NotAllowed > 0 {
+		fmt.Fprintf(w, "; refused %d requests from devices that aren't allowed", r.NotAllowed)
 	}
 	fmt.Fprintln(w, ".")
 }

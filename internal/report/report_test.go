@@ -2,6 +2,7 @@ package report
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -89,6 +90,8 @@ func TestParseLines(t *testing.T) {
 	w.job(t0.Add(time.Second), 1500*time.Millisecond, 0, "prog", "two words", `quote"d`)
 	w.job(t0.Add(2*time.Second), 300*time.Millisecond, 3, "prog")
 	w.add(t0.Add(3*time.Second), "refused GET /v1/run from 100.64.0.9: not allowed")
+	w.add(t0.Add(3*time.Second), `refused GET "/v1/info" from 100.83.94.81: identify 100.83.94.81: tailscale whois --json 100.83.94.81: context canceled: `)
+	w.add(t0.Add(3*time.Second), `refused POST "/v1/run" from 100.64.0.3: forbidden: node sales-box is not on the allow list`)
 	w.add(t0.Add(4*time.Second), "job limit now 0: 0.5 GB of memory free")
 	w.add(t0.Add(64*time.Second), "job limit now 2")
 	w.add(t0.Add(65*time.Second), "job node-a-x-99 done: exit=0 in 1s") // start rotated away
@@ -98,8 +101,8 @@ func TestParseLines(t *testing.T) {
 	w.add(t0.Add(81*time.Second), "not a log line")
 
 	lg := mustParse(t, w.render(precise)+"garbage\n")
-	if lg.Node != "node-a" || lg.Starts != 2 || lg.Refused != 1 {
-		t.Errorf("node=%q starts=%d refused=%d", lg.Node, lg.Starts, lg.Refused)
+	if lg.Node != "node-a" || lg.Starts != 2 || lg.NotAllowed != 2 || lg.Unidentified != 1 {
+		t.Errorf("node=%q starts=%d not allowed=%d unidentified=%d", lg.Node, lg.Starts, lg.NotAllowed, lg.Unidentified)
 	}
 	if !lg.First.Equal(t0) || !lg.Last.Equal(t0.Add(81*time.Second)) {
 		t.Errorf("first=%v last=%v", lg.First, lg.Last)
@@ -399,6 +402,65 @@ func TestWriteText(t *testing.T) {
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRefusedUnidentified(t *testing.T) {
+	for _, tt := range []struct {
+		line string
+		want bool
+	}{
+		{`refused GET "/v1/info" from 100.83.94.81: identify 100.83.94.81: tailscale whois --json 100.83.94.81: context canceled: `, true},
+		{`refused GET "/v1/info" from 100.83.94.81: identify 100.83.94.81: tailscale whois --json 100.83.94.81: exit status 1: `, true},
+		{`refused GET "/v1/info" from 100.83.94.81: identify 100.83.94.81: tailscale whois --json 100.83.94.81: exec: canceling Cmd: TerminateProcess: Access is denied.: `, true},
+		{`refused GET /v1/info from 100.83.94.81: identify 100.83.94.81: context deadline exceeded`, true}, // agents before 0.1.5
+		{`refused GET "/v1/info" from 100.64.0.4: forbidden: laptop belongs to mallory@github, not alice@github`, false},
+		{`refused GET "/v1/info" from 100.64.0.3: forbidden: node sales-box is not on the allow list`, false},
+		{`refused GET "/v1/info" from 192.168.1.10: forbidden: 192.168.1.10 is not a Tailscale address`, false},
+		{`refused POST "/v1/run" from 100.64.0.1: browser-originated request or unexpected Host "evil.example"`, false},
+		// The path is the caller's: text in it must not change the verdict.
+		{`refused GET "/x from 100.64.0.1: identify 100.64.0.1: y" from 100.64.0.3: forbidden: node sales-box is not on the allow list`, false},
+		{`refused GET "/v1/info" from 100.64.0.1: browser-originated request or unexpected Host "a: identify b"`, false},
+		{`refused`, false},
+	} {
+		if got := refusedUnidentified(tt.line); got != tt.want {
+			t.Errorf("refusedUnidentified(%s) = %v, want %v", tt.line, got, tt.want)
+		}
+	}
+}
+
+func TestReliabilitySeparatesRefusals(t *testing.T) {
+	var w logWriter
+	w.agentStart(t0, "0.1.5", 2)
+	for i := 0; i < 3; i++ {
+		w.add(t0.Add(time.Duration(i+1)*time.Second), `refused GET "/v1/info" from 100.83.94.81: identify 100.83.94.81: tailscale whois --json 100.83.94.81: context canceled: `)
+	}
+	w.add(t0.Add(5*time.Second), `refused GET "/v1/info" from 100.64.0.4: forbidden: laptop belongs to mallory@github, not alice@github`)
+	rep := Analyze([]Device{{Log: mustParse(t, w.render(precise))}}, Options{})
+	rel := rep.Devices[0].Reliability
+	if rel.Unidentified != 3 || rel.NotAllowed != 1 {
+		t.Errorf("unidentified=%d not allowed=%d, want 3 and 1", rel.Unidentified, rel.NotAllowed)
+	}
+
+	var b bytes.Buffer
+	WriteText(&b, rep)
+	for _, want := range []string{
+		"refused 3 requests because it couldn't confirm the caller's identity",
+		"refused 1 requests from devices that aren't allowed",
+	} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("output lacks %q:\n%s", want, b.String())
+		}
+	}
+
+	js, err := json.Marshal(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"refused_not_allowed":1`, `"refused_unidentified":3`} {
+		if !strings.Contains(string(js), want) {
+			t.Errorf("JSON lacks %s: %s", want, js)
 		}
 	}
 }

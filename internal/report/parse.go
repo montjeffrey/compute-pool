@@ -62,13 +62,19 @@ type Pause struct {
 
 // Log is what one agent log says.
 type Log struct {
-	Node    string    `json:"node"`
-	First   time.Time `json:"first"`
-	Last    time.Time `json:"last"`
-	Jobs    []Job     `json:"-"`
-	Starts  int       `json:"agent_starts"` // times the agent started
-	Pauses  []Pause   `json:"pauses"`
-	Refused int       `json:"refused"` // requests refused by authentication
+	Node   string    `json:"node"`
+	First  time.Time `json:"first"`
+	Last   time.Time `json:"last"`
+	Jobs   []Job     `json:"-"`
+	Starts int       `json:"agent_starts"` // times the agent started
+	Pauses []Pause   `json:"pauses"`
+	// Requests refused by authentication: NotAllowed came from a device
+	// (or a web page) that may not use the agent; Unidentified were refused
+	// because the agent couldn't confirm who was calling (tailscale whois
+	// failed or was too slow), which is usually the owner's own device
+	// asking while one of the two is busy.
+	NotAllowed   int `json:"refused_not_allowed"`
+	Unidentified int `json:"refused_unidentified"`
 }
 
 var (
@@ -171,7 +177,11 @@ func Parse(r io.Reader) (*Log, error) {
 			continue
 		}
 		if strings.HasPrefix(msg, "refused ") {
-			lg.Refused++
+			if refusedUnidentified(msg) {
+				lg.Unidentified++
+			} else {
+				lg.NotAllowed++
+			}
 		}
 	}
 	// Jobs still open at the end may be running now; they are not lost.
@@ -186,6 +196,28 @@ func Parse(r io.Reader) (*Log, error) {
 	setConcurrency(lg.Jobs)
 	setWorkloads(lg.Jobs)
 	return lg, nil
+}
+
+// refusedUnidentified reports whether a refusal line,
+//
+//	refused METHOD "PATH" from ADDR: REASON
+//
+// was the agent failing to identify the caller ("identify ADDR: ...")
+// rather than a caller it identified and doesn't allow. Only REASON is
+// checked, since the path is the caller's and may hold any text. Agents
+// before 0.1.5 logged the path unquoted; there the first " from " ends it.
+func refusedUnidentified(msg string) bool {
+	_, rest, ok := strings.Cut(strings.TrimPrefix(msg, "refused "), " ") // method
+	if !ok {
+		return false
+	}
+	if q, err := strconv.QuotedPrefix(rest); err == nil {
+		rest = strings.TrimPrefix(rest[len(q):], " from ")
+	} else if _, rest, ok = strings.Cut(rest, " from "); !ok {
+		return false
+	}
+	_, reason, ok := strings.Cut(rest, ": ") // the address
+	return ok && strings.HasPrefix(reason, "identify ")
 }
 
 // maxLineBytes bounds a log line. A job's whole argv is logged, so a line
