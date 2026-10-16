@@ -836,13 +836,22 @@ func TestInfoReportsLiveLimit(t *testing.T) {
 	if res, _, _, err := h.run(t, context.Background(), helperRequest(t, "echo", nil)); err != nil || res.ExitCode != 3 {
 		t.Fatalf("probe job: res=%+v err=%v", res, err)
 	}
-	// The echo job needed far less than 512 MB, so all four slots fit.
+	// From now on the agent plans with the echo job's measured peak. Its size
+	// depends on the platform (the race detector's runtime alone takes
+	// hundreds of MB on Linux), so the checks follow from it.
 	info, _ = h.client.Info(context.Background(), h.host)
-	if !info.JobMemoryMeasured || info.JobMemoryMB >= 512 || info.JobLimit != 4 || !info.Accepting {
-		t.Errorf("after measuring: %+v", info)
+	if !info.JobMemoryMeasured || info.JobMemoryMB <= 0 {
+		t.Fatalf("after measuring: %+v", info)
+	}
+	reserve, perJob := int64(16384/10), info.JobMemoryMB
+
+	probe.snap.Memory.FreeMB = reserve + 2*perJob + perJob/2 // room for two jobs
+	info, _ = h.client.Info(context.Background(), h.host)
+	if !info.Accepting || info.JobLimit != 2 || !strings.Contains(info.LimitReason, fmt.Sprintf("about %d MB per job", perJob)) {
+		t.Errorf("room for two measured jobs: %+v", info)
 	}
 
-	probe.snap.Memory.FreeMB = 8192 // the owner closed something
+	probe.snap.Memory.FreeMB = reserve + 5*perJob // the owner closed something
 	info, _ = h.client.Info(context.Background(), h.host)
 	if !info.Accepting || info.JobLimit != 4 || info.LimitReason != "" {
 		t.Errorf("with memory free: %+v", info)
