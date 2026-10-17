@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/montjeffrey/compute-pool/internal/agent"
 	"github.com/montjeffrey/compute-pool/internal/client"
+	"github.com/montjeffrey/compute-pool/internal/hwinfo"
 	"github.com/montjeffrey/compute-pool/internal/proto"
 	"github.com/montjeffrey/compute-pool/internal/sysinfo"
 )
@@ -66,6 +68,13 @@ func TestHelperProcess(t *testing.T) {
 		a, err2 := os.Stat(self)
 		b, err3 := os.Stat(os.Getenv("SAME_AS"))
 		fmt.Print(err1 == nil && err2 == nil && err3 == nil && os.SameFile(a, b))
+	case "alloc":
+		// Use 200 MB, touching every page so it is really committed.
+		b := make([]byte, 200<<20)
+		for i := 0; i < len(b); i += 4096 {
+			b[i] = 1
+		}
+		runtime.KeepAlive(b)
 	case "sleep":
 		time.Sleep(time.Minute)
 	case "spawn":
@@ -763,6 +772,105 @@ func TestBusyThreshold(t *testing.T) {
 	if !info.Accepting || info.Reason != "" {
 		t.Errorf("info after load dropped = %+v", info)
 	}
+
+	// Load from the agent's own jobs doesn't count: 92% busy, 75% of it
+	// ours, leaves 17% from other programs.
+	probe.snap.CPUBusyPct, probe.snap.OwnBusyPct = 92, 75
+	info, _ = h.client.Info(context.Background(), h.host)
+	if !info.Accepting {
+		t.Errorf("refused because of its own jobs: %+v", info)
+	}
+	// But other programs past the threshold still pause it.
+	probe.snap.CPUBusyPct, probe.snap.OwnBusyPct = 100, 15
+	info, _ = h.client.Info(context.Background(), h.host)
+	if info.Accepting || !strings.Contains(info.Reason, "cpu busy (85%)") {
+		t.Errorf("not paused by other programs: %+v", info)
+	}
+}
+
+func TestInfoReportsSpecsAndCapacity(t *testing.T) {
+	specs := hwinfo.Specs{CPUModel: "Example CPU", LogicalCPUs: 16, PhysicalCores: 8, MemoryMB: 16384}
+	measured := proto.Capacity{Kernel: "test", Levels: []proto.Level{{Jobs: 1, Rate: 90}, {Jobs: 8, Rate: 600}}}
+	h := newHarnessWith(t, 1, allowAll{}, func(c *agent.Config) { c.Specs, c.Capacity = &specs, &measured })
+	info, err := h.client.Info(context.Background(), h.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Specs == nil || *info.Specs != specs {
+		t.Errorf("specs = %+v", info.Specs)
+	}
+	if info.Capacity == nil || info.Capacity.RateAt(8) != 600 {
+		t.Errorf("capacity = %+v", info.Capacity)
+	}
+	// An agent configured without them leaves them out.
+	plain := newHarness(t, 1, allowAll{})
+	if info, err := plain.client.Info(context.Background(), plain.host); err != nil || info.Specs != nil || info.Capacity != nil {
+		t.Errorf("unconfigured agent: specs %v, capacity %v, err %v", info.Specs, info.Capacity, err)
+	}
+}
+
+func TestInfoReportsLiveLimit(t *testing.T) {
+	// 1.5 GB free of 16 GB is less than the 1.6 GB kept for the owner.
+	probe := &fixedProbe{sysinfo.Snapshot{CPUBusyPct: -1, OwnBusyPct: -1, Power: sysinfo.Power{BatteryPct: -1},
+		Memory: sysinfo.Memory{Known: true, TotalMB: 16384, FreeMB: 1536}}}
+	h := newHarnessWith(t, 4, allowAll{}, func(c *agent.Config) { c.Probe = probe.get })
+	info, err := h.client.Info(context.Background(), h.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Accepting || info.JobLimit != 0 || info.FreeMemoryMB != 1536 || info.JobMemoryMB != 512 || info.JobMemoryMeasured ||
+		!strings.HasPrefix(info.Reason, "taking no jobs for now: 1.5 GB of memory free") || !strings.Contains(info.LimitReason, "memory") {
+		t.Errorf("short of memory: %+v", info)
+	}
+	if _, _, _, err := h.run(t, context.Background(), helperRequest(t, "echo", nil)); !errors.Is(err, client.ErrBusy) {
+		t.Errorf("run while short of memory: err = %v, want ErrBusy", err)
+	}
+
+	// 2 GB free: not enough for the 512 MB guess, so one job runs to learn
+	// what jobs really need.
+	probe.snap.Memory.FreeMB = 2048
+	info, _ = h.client.Info(context.Background(), h.host)
+	if !info.Accepting || info.JobLimit != 1 || !strings.Contains(info.LimitReason, "one job at a time") {
+		t.Errorf("probing: %+v", info)
+	}
+	if res, _, _, err := h.run(t, context.Background(), helperRequest(t, "echo", nil)); err != nil || res.ExitCode != 3 {
+		t.Fatalf("probe job: res=%+v err=%v", res, err)
+	}
+	// From now on the agent plans with the echo job's measured peak. Its size
+	// depends on the platform (the race detector's runtime alone takes
+	// hundreds of MB on Linux), so the checks follow from it.
+	info, _ = h.client.Info(context.Background(), h.host)
+	if !info.JobMemoryMeasured || info.JobMemoryMB <= 0 {
+		t.Fatalf("after measuring: %+v", info)
+	}
+	reserve, perJob := int64(16384/10), info.JobMemoryMB
+
+	probe.snap.Memory.FreeMB = reserve + 2*perJob + perJob/2 // room for two jobs
+	info, _ = h.client.Info(context.Background(), h.host)
+	if !info.Accepting || info.JobLimit != 2 || !strings.Contains(info.LimitReason, fmt.Sprintf("about %d MB per job", perJob)) {
+		t.Errorf("room for two measured jobs: %+v", info)
+	}
+
+	probe.snap.Memory.FreeMB = reserve + 5*perJob // the owner closed something
+	info, _ = h.client.Info(context.Background(), h.host)
+	if !info.Accepting || info.JobLimit != 4 || info.LimitReason != "" {
+		t.Errorf("with memory free: %+v", info)
+	}
+}
+
+func TestJobMemoryIsMeasured(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	if res, _, stderr, err := h.run(t, context.Background(), helperRequest(t, "alloc", nil)); err != nil || res.ExitCode != 0 {
+		t.Fatalf("alloc job: res=%+v err=%v stderr=%s", res, err, stderr)
+	}
+	info, err := h.client.Info(context.Background(), h.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The job used 200 MB on top of the test binary itself.
+	if !info.JobMemoryMeasured || info.JobMemoryMB < 200 || info.JobMemoryMB > 1024 {
+		t.Errorf("job memory = %d MB (measured %v), want 200-1024", info.JobMemoryMB, info.JobMemoryMeasured)
+	}
 }
 
 func TestInfoWithoutProbeIsAcceptingAndUnknown(t *testing.T) {
@@ -781,5 +889,110 @@ func TestEmptyCommandRejected(t *testing.T) {
 	_, _, _, err := h.run(t, context.Background(), proto.RunRequest{})
 	if err == nil || !strings.Contains(err.Error(), "400") {
 		t.Errorf("err = %v, want a 400 error", err)
+	}
+}
+
+func TestLogServesRotatedThenCurrent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agent.log")
+	if err := os.WriteFile(path+".1", []byte("old line\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("new line\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := newHarnessWith(t, 1, allowAll{}, func(c *agent.Config) { c.LogPath = path })
+	got, err := h.client.Log(context.Background(), h.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "old line\nnew line\n" {
+		t.Errorf("log = %q", got)
+	}
+}
+
+func TestLogWithoutFile(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	_, err := h.client.Log(context.Background(), h.host)
+	if !errors.Is(err, client.ErrNoLog) {
+		t.Errorf("err = %v, want ErrNoLog", err)
+	}
+}
+
+func TestLogRequiresAuthorization(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agent.log")
+	if err := os.WriteFile(path, []byte("secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := newHarnessWith(t, 1, denyAll{}, func(c *agent.Config) { c.LogPath = path })
+	if _, err := h.client.Log(context.Background(), h.host); !errors.Is(err, client.ErrForbidden) {
+		t.Errorf("err = %v, want ErrForbidden", err)
+	}
+}
+
+func TestReadLogIncludesRotated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.log")
+	if _, err := agent.ReadLog(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("missing log: err = %v", err)
+	}
+	if err := os.WriteFile(path+".1", []byte("a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := agent.ReadLog(path); err != nil || string(b) != "a\n" {
+		t.Errorf("only the rotated file: got %q, %v", b, err)
+	}
+	if err := os.WriteFile(path, []byte("b\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := agent.ReadLog(path); err != nil || string(b) != "a\nb\n" {
+		t.Errorf("got %q, %v", b, err)
+	}
+}
+
+func TestRefusedPathCantForgeLogLines(t *testing.T) {
+	var buf bytes.Buffer
+	h := newHarnessWith(t, 1, denyAll{}, func(c *agent.Config) { c.Logger = log.New(&buf, "", 0) })
+	resp, err := http.Get("http://" + net.JoinHostPort(h.host, strconv.Itoa(h.client.Port)) + "/v1/x%0Ajob%20forged%20done:%20exit=0%20in%201s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if lines := strings.Count(strings.TrimSpace(buf.String()), "\n") + 1; lines != 1 || strings.Contains(buf.String(), "\njob forged") {
+		t.Errorf("log:\n%s", buf.String())
+	}
+}
+
+// slowWhois stands for tailscale whois failing or timing out on a busy
+// device: not a refusal, just no answer yet.
+type slowWhois struct{}
+
+func (slowWhois) Authorize(context.Context, string) (agent.Identity, error) {
+	return agent.Identity{}, errors.New("identify 100.64.0.2: tailscale whois --json 100.64.0.2: context canceled")
+}
+
+func TestUnconfirmedCallerIsBusyNotForbidden(t *testing.T) {
+	h := newHarness(t, 1, slowWhois{})
+	_, err := h.client.Info(context.Background(), h.host)
+	if !errors.Is(err, client.ErrBusy) || errors.Is(err, client.ErrForbidden) {
+		t.Fatalf("err = %v, want ErrBusy", err)
+	}
+	if !strings.Contains(err.Error(), "can't confirm who is asking yet") {
+		t.Errorf("err = %v", err)
+	}
+	resp, err := http.Get("http://" + net.JoinHostPort(h.host, strconv.Itoa(h.client.Port)) + "/v1/info")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+		t.Errorf("status %d, Retry-After %q", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+}
+
+func TestDisallowedCallerIsForbidden(t *testing.T) {
+	h := newHarness(t, 1, denyAll{})
+	if _, err := h.client.Info(context.Background(), h.host); !errors.Is(err, client.ErrForbidden) {
+		t.Errorf("err = %v, want ErrForbidden", err)
 	}
 }

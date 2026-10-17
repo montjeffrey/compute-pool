@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -60,6 +61,80 @@ func TestSamplerSmoothsAndReportsUnknownFirst(t *testing.T) {
 	}
 	if p := s.Snapshot().Power; !p.OnBattery || p.BatteryPct != 40 {
 		t.Errorf("power = %+v", p)
+	}
+}
+
+func TestSamplerSeparatesOwnUse(t *testing.T) {
+	cpu := []cpuTimes{{idle: 0, total: 0}, {idle: 20, total: 100}, {idle: 30, total: 200}}
+	own := []uint64{1000, 1060, 1130} // 60 then 70 of each 100 units
+	i := 0
+	s := &Sampler{
+		busy:      -1,
+		readCPU:   func() (cpuTimes, error) { return cpu[i], nil },
+		readPower: func() (Power, error) { return Power{}, nil },
+	}
+	s.SetOwnReader(func() (uint64, error) { r := own[i]; i++; return r, nil })
+	s.sample()
+	if snap := s.Snapshot(); snap.OwnBusyPct != -1 || snap.OtherBusyPct() != -1 {
+		t.Fatalf("before a full interval: %+v", snap)
+	}
+	s.sample() // 80% busy, 60% ours
+	if snap := s.Snapshot(); snap.CPUBusyPct != 80 || snap.OwnBusyPct != 60 || snap.OtherBusyPct() != 20 {
+		t.Errorf("first interval: %+v, other %v", snap, snap.OtherBusyPct())
+	}
+	s.sample() // 90% busy, 70% ours; smoothed: 85 and 65
+	if snap := s.Snapshot(); snap.CPUBusyPct != 85 || snap.OwnBusyPct != 65 || snap.OtherBusyPct() != 20 {
+		t.Errorf("second interval: %+v, other %v", snap, snap.OtherBusyPct())
+	}
+}
+
+func TestSamplerOwnUseUnknownCountsEverything(t *testing.T) {
+	cpu := []cpuTimes{{idle: 0, total: 0}, {idle: 20, total: 100}}
+	i := 0
+	s := &Sampler{
+		busy:      -1,
+		readCPU:   func() (cpuTimes, error) { r := cpu[i]; i++; return r, nil },
+		readPower: func() (Power, error) { return Power{}, nil },
+	}
+	s.SetOwnReader(func() (uint64, error) { return 0, errUnsupported })
+	s.sample()
+	s.sample()
+	if snap := s.Snapshot(); snap.CPUBusyPct != 80 || snap.OwnBusyPct != -1 || snap.OtherBusyPct() != 80 {
+		t.Errorf("snapshot = %+v, other %v", snap, snap.OtherBusyPct())
+	}
+	// Our share can't exceed the total, whatever the counters say.
+	if got := (Snapshot{CPUBusyPct: 30, OwnBusyPct: 50}).OtherBusyPct(); got != 0 {
+		t.Errorf("OtherBusyPct with own above total = %v", got)
+	}
+}
+
+func TestParseProcPIDStat(t *testing.T) {
+	line := "4321 (pool (agent) x) S 1 4321 4321 0 -1 4194560 100 0 0 0 250 50 30 20 20 0 9 0 12345 0 0\n"
+	p, err := parseProcPIDStat(line)
+	if err != nil || p.pid != 4321 || p.ppid != 1 || p.cpu != 350 {
+		t.Errorf("parse = %+v, %v", p, err)
+	}
+	for _, bad := range []string{"", "12 no-parens S 1", "x (a) S 1 2 3", "1 (a) S 1 2 3 4 5 6 7 8 9 10 x 1 1 1"} {
+		if _, err := parseProcPIDStat(bad); err == nil {
+			t.Errorf("parseProcPIDStat(%q): no error", bad)
+		}
+	}
+}
+
+func TestTreeCPU(t *testing.T) {
+	procs := []procStat{
+		{pid: 1, ppid: 0, cpu: 1000},  // init: not ours
+		{pid: 10, ppid: 1, cpu: 5},    // the agent
+		{pid: 11, ppid: 10, cpu: 300}, // a job
+		{pid: 12, ppid: 11, cpu: 200}, // its child
+		{pid: 13, ppid: 10, cpu: 100}, // another job
+		{pid: 20, ppid: 1, cpu: 900},  // the owner's program
+	}
+	if got := treeCPU(procs, 10); got != 605 {
+		t.Errorf("treeCPU = %d, want 605", got)
+	}
+	if got := treeCPU(procs, 99); got != 0 {
+		t.Errorf("treeCPU of a missing process = %d", got)
 	}
 }
 
@@ -162,6 +237,39 @@ func TestParsePmset(t *testing.T) {
 	}
 }
 
+func TestParseMemInfo(t *testing.T) {
+	data := "MemTotal:       16303428 kB\nMemFree:          812344 kB\nMemAvailable:    9437184 kB\nBuffers: 1 kB\n"
+	m, err := parseMemInfo(data)
+	if err != nil || m != (Memory{Known: true, TotalMB: 15921, FreeMB: 9216}) {
+		t.Errorf("parse = %+v, %v", m, err)
+	}
+	// Kernels before 3.14 have no MemAvailable; don't guess from MemFree.
+	if _, err := parseMemInfo("MemTotal: 1000 kB\nMemFree: 500 kB\n"); err == nil {
+		t.Error("no error without MemAvailable")
+	}
+}
+
+func TestSamplerReportsMemory(t *testing.T) {
+	free := int64(4000)
+	s := &Sampler{
+		busy:      -1,
+		readCPU:   func() (cpuTimes, error) { return cpuTimes{}, errUnsupported },
+		readPower: func() (Power, error) { return Power{}, nil },
+		readMem:   func() (Memory, error) { return Memory{Known: true, TotalMB: 8000, FreeMB: free}, nil },
+	}
+	s.sample()
+	free = 1500 // not smoothed: the latest reading counts
+	s.sample()
+	if m := s.Snapshot().Memory; !m.Known || m.FreeMB != 1500 || m.TotalMB != 8000 {
+		t.Errorf("memory = %+v", m)
+	}
+	s.readMem = func() (Memory, error) { return Memory{}, errUnsupported }
+	s.sample()
+	if m := s.Snapshot().Memory; m.Known {
+		t.Errorf("after a failed read memory = %+v, want unknown", m)
+	}
+}
+
 func TestRealSamplerDoesNotFail(t *testing.T) {
 	// Smoke test against this machine: values may be unknown but must be sane.
 	s := NewSampler()
@@ -172,5 +280,11 @@ func TestRealSamplerDoesNotFail(t *testing.T) {
 	}
 	if snap.Power.BatteryPct < -1 || snap.Power.BatteryPct > 100 {
 		t.Errorf("BatteryPct = %v", snap.Power.BatteryPct)
+	}
+	if m := snap.Memory; m.Known && (m.TotalMB <= 0 || m.FreeMB < 0 || m.FreeMB > m.TotalMB) {
+		t.Errorf("Memory = %+v", m)
+	}
+	if (runtime.GOOS == "windows" || runtime.GOOS == "linux") && !snap.Memory.Known {
+		t.Error("memory unknown on a platform that supports it")
 	}
 }

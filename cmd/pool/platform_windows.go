@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"syscall"
 	"unsafe"
+
+	"github.com/montjeffrey/compute-pool/internal/sysinfo"
 )
 
 var (
@@ -74,11 +76,48 @@ func containChildren() error {
 	}
 	// The handle is deliberately never closed: the OS closes it when the
 	// agent exits, and that is what ends the jobs.
+	agentJob = h
 	return nil
+}
+
+// agentJob is the job object holding the agent and its jobs, once
+// containChildren has created it.
+var agentJob uintptr
+
+// ownCPUReader reads the CPU time of the agent and its jobs from the job
+// object's accounting, or returns nil if there is no job object.
+func ownCPUReader() func() (uint64, error) {
+	if agentJob == 0 {
+		return nil
+	}
+	h := agentJob
+	return func() (uint64, error) { return sysinfo.JobCPUTimes(h) }
 }
 
 // hideConsole detaches from the console window the startup task creates.
 func hideConsole() { procFreeConsole.Call() }
+
+// tokenElevation is TOKEN_INFORMATION_CLASS's TokenElevation.
+const tokenElevation = 20
+
+// isElevated reports whether this process runs as administrator, which
+// pool install needs to start the agent at boot rather than at logon.
+func isElevated() bool {
+	p, err := syscall.GetCurrentProcess()
+	if err != nil {
+		return false
+	}
+	var t syscall.Token
+	if syscall.OpenProcessToken(p, syscall.TOKEN_QUERY, &t) != nil {
+		return false
+	}
+	defer t.Close()
+	var elevated, n uint32
+	if syscall.GetTokenInformation(t, tokenElevation, (*byte)(unsafe.Pointer(&elevated)), 4, &n) != nil {
+		return false
+	}
+	return elevated != 0
+}
 
 func openBrowser(url string) error {
 	return exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
