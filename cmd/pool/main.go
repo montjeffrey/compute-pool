@@ -29,8 +29,13 @@ import (
 const usage = `pool shares CPU between your own devices over Tailscale.
 
 Usage:
+  pool setup [flags]            measure this device and recommend (and apply)
+                                settings for its agent
   pool agent [flags]            lend this device's CPU to allowed devices
   pool nodes [flags]            list tailnet devices running an agent
+  pool advise [flags]           compare every device: capacity, expected speedup, what to change
+  pool report [flags]           assess past use from agent logs: speed by jobs at once,
+                                consistency between runs, slot use, reliability
   pool run [--node N] [flags] -- command [args...]
                                 run a command on the least-loaded device (or on N)
                                 and stream its output
@@ -59,6 +64,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 	var err error
 	code := 0
 	switch args[0] {
+	case "setup":
+		err = cmdSetup(ctx, args[1:], os.Stdin, stdout, stderr)
+	case "advise":
+		err = cmdAdvise(ctx, args[1:], stdout, stderr)
+	case "report":
+		err = cmdReport(ctx, args[1:], stdout, stderr)
 	case "agent":
 		err = cmdAgent(ctx, args[1:], stderr)
 	case "nodes":
@@ -183,8 +194,13 @@ func probeAll(ctx context.Context, st tsutil.Status, c *client.Client, timeout t
 }
 
 func probeStatus(err error) string {
-	if errors.Is(err, client.ErrForbidden) {
+	switch {
+	case errors.Is(err, client.ErrForbidden):
 		return "agent refuses this device (add it to --allow)"
+	case errors.Is(err, client.ErrBusy):
+		// An agent answers busy to a status request only when it couldn't
+		// confirm who is asking yet (tailscale slow on a busy device).
+		return "agent busy: " + strings.TrimPrefix(err.Error(), client.ErrBusy.Error()+": ")
 	}
 	return "no agent"
 }

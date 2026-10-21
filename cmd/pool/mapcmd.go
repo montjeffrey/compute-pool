@@ -18,8 +18,11 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"text/tabwriter"
 	"time"
 
+	"github.com/montjeffrey/compute-pool/internal/advise"
+	"github.com/montjeffrey/compute-pool/internal/capacity"
 	"github.com/montjeffrey/compute-pool/internal/client"
 	"github.com/montjeffrey/compute-pool/internal/fanout"
 	"github.com/montjeffrey/compute-pool/internal/proto"
@@ -229,6 +232,8 @@ func cmdMap(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 	port := fs.Int("port", proto.DefaultPort, "agent TCP port")
 	probeTimeout := fs.Duration("probe-timeout", time.Second, "how long to wait for each device's status")
 	verbose := fs.Bool("v", false, "print a line per task with its device and duration")
+	dryRun := fs.Bool("dry-run", false, "predict how the tasks would spread over the devices, and run nothing")
+	taskTime := fs.Duration("task-time", 0, "with --dry-run: how long one task takes when run alone on this device")
 	env := envFlag{}
 	fs.Var(env, "env", "environment variable for every task (KEY=VALUE, repeatable)")
 	fs.Usage = func() {
@@ -244,6 +249,12 @@ func cmdMap(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 		fs.Usage()
 		return 2, errors.New("a command is required")
 	}
+	if *taskTime != 0 && !*dryRun {
+		return 2, errors.New("--task-time only applies with --dry-run")
+	}
+	if *taskTime < 0 {
+		return 2, errors.New("--task-time must be positive")
+	}
 	tasks, localInputs, err := buildTasks(*rangeSpec, *itemsFile, inputs, os.Stdin)
 	if err != nil {
 		return 2, err
@@ -258,6 +269,10 @@ func cmdMap(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 	devices, err := mapDevices(ctx, c, *nodes, *probeTimeout)
 	if err != nil {
 		return 1, err
+	}
+	if *dryRun {
+		printPlan(stdout, advise.PlanJob(planDevices(devices), len(tasks), *taskTime, *jobs))
+		return 0, nil
 	}
 
 	width := len(strconv.Itoa(len(tasks)))
@@ -383,6 +398,68 @@ func cmdMap(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 type mapDevice struct {
 	fanout.Device
 	host string
+	self bool
+	info proto.Info
+}
+
+// planDevices describes the devices for a dry run. This device's saved
+// measurement is read locally if its agent doesn't report one.
+func planDevices(devices []mapDevice) []advise.PlanDevice {
+	var out []advise.PlanDevice
+	for _, d := range devices {
+		measured := d.info.Capacity
+		if d.self && measured == nil {
+			measured, _ = capacity.Load(capacityPath())
+		}
+		out = append(out, advise.PlanDevice{
+			Name: d.Name, Self: d.self, Slots: d.Slots, Capacity: measured,
+			// Busy slots will free up during the run; only battery or the
+			// owner's own load hold a device back.
+			Paused: !d.info.Accepting && !strings.HasPrefix(d.info.Reason, "all "),
+		})
+	}
+	return out
+}
+
+func printPlan(w io.Writer, p advise.Plan) {
+	fmt.Fprintf(w, "Dry run: %d tasks; nothing was run.\n", p.Tasks)
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "DEVICE\tSLOTS\tPER TASK\tTASKS\tSHARE")
+	assumed := false
+	for _, r := range p.Rows {
+		name := r.Name
+		if r.Self {
+			name += " (this device)"
+		}
+		if r.Assumed {
+			name += " *"
+			assumed = true
+		}
+		per, tasks, share := "-", fmt.Sprint(r.Tasks), fmt.Sprintf("%.0f%%", 100*r.Share)
+		if r.TaskTime > 0 {
+			per = r.TaskTime.Round(100 * time.Millisecond).String()
+		}
+		if r.Paused {
+			tasks, share = "paused", "-"
+		}
+		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\n", name, r.Slots, per, tasks, share)
+	}
+	tw.Flush()
+	if assumed {
+		fmt.Fprintln(w, "* not measured, so assumed as fast as this device; run pool setup there.")
+	}
+	switch {
+	case p.TaskTime == 0:
+		fmt.Fprintln(w, "Add --task-time (how long one task takes alone on this device) to predict how long the run takes.")
+	case p.Alone > 0:
+		fmt.Fprintf(w, "Predicted: about %s using these devices, against %s on this device alone (%.2f× as fast).\n",
+			p.Pool.Round(time.Second), p.Alone.Round(time.Second), p.Speedup)
+	default:
+		fmt.Fprintf(w, "Predicted: about %s using these devices.\n", p.Pool.Round(time.Second))
+	}
+	for _, warning := range p.Warnings {
+		fmt.Fprintf(w, "Note: %s.\n", warning)
+	}
 }
 
 // mapDevices finds every device whose agent answers, optionally limited to
@@ -416,7 +493,8 @@ func mapDevices(ctx context.Context, c *client.Client, only string, timeout time
 		if r.err != nil {
 			continue
 		}
-		devs = append(devs, mapDevice{Device: fanout.Device{Name: r.peer.Name, Slots: r.info.MaxJobs}, host: r.peer.IPv4})
+		devs = append(devs, mapDevice{Device: fanout.Device{Name: r.peer.Name, Slots: r.info.MaxJobs}, host: r.peer.IPv4,
+			self: r.peer.Self, info: r.info})
 		cands = append(cands, client.Candidate{Name: r.peer.Name, Host: r.peer.IPv4, Info: r.info})
 	}
 	if len(client.Rank(cands)) == 0 {

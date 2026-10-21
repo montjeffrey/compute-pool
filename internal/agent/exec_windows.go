@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/montjeffrey/compute-pool/internal/proto"
+	"github.com/montjeffrey/compute-pool/internal/sysinfo"
 )
 
 const (
@@ -61,3 +62,8 @@ func reapTree(*exec.Cmd) {}
 
 // lowerPriority is a no-op on Windows; CreationFlags already set the class.
 func lowerPriority(*exec.Cmd) {}
+
+// trackMemory starts measuring the job's memory. The returned function
+// reports the peak in bytes (0 if unknown) once the job has exited. A child
+// the job starts in the instant before tracking begins isn't counted.
+func trackMemory(cmd *exec.Cmd) func() uint64 { return sysinfo.TrackMemory(cmd.Process.Pid) }

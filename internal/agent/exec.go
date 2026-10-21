@@ -70,9 +70,11 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 		return exitNotStarted, 0, fmt.Errorf("start %s: %w", req.Argv[0], err)
 	}
 	lowerPriority(cmd)
+	peakMemory := trackMemory(cmd)
 	err = cmd.Wait()
 	dur := time.Since(start)
 	reapTree(cmd)
+	a.mem.observe(peakMemory())
 
 	switch {
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):

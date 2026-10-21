@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/montjeffrey/compute-pool/internal/agent"
+	"github.com/montjeffrey/compute-pool/internal/capacity"
+	"github.com/montjeffrey/compute-pool/internal/hwinfo"
 	"github.com/montjeffrey/compute-pool/internal/proto"
 	"github.com/montjeffrey/compute-pool/internal/sysinfo"
 	"github.com/montjeffrey/compute-pool/internal/tsutil"
@@ -34,6 +36,7 @@ type agentFlags struct {
 	lendOnBattery *bool
 	busyThreshold *float64
 	cacheMB       *int64
+	jobMemory     *int64
 	logFile       *string
 	hideConsole   *bool
 }
@@ -50,6 +53,7 @@ func newAgentFlags(name string, stderr io.Writer) (*flag.FlagSet, *agentFlags) {
 		lendOnBattery: fs.Bool("lend-on-battery", false, "accept jobs while this device runs on battery"),
 		busyThreshold: fs.Float64("busy-threshold", 80, "refuse new jobs while CPU use is at or above this percent (0 = never)"),
 		cacheMB:       fs.Int64("cache-mb", 2048, "disk space for caching shipped files between jobs (0 = no cache)"),
+		jobMemory:     fs.Int64("job-memory", agent.DefaultJobMemoryMB, "memory in MB to assume each job needs until jobs have been measured"),
 		logFile:       fs.String("log-file", "", "append the agent's log to this file instead of stderr"),
 		hideConsole:   fs.Bool("hide-console", false, "detach from the console window (used by the startup task)"),
 	}
@@ -63,16 +67,22 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 	if *f.hideConsole {
 		hideConsole()
 	}
-	logOut := stderr
+	logOut, logPath := stderr, ""
 	if *f.logFile != "" {
-		lf, err := newRotatingLog(*f.logFile)
+		abs, err := filepath.Abs(*f.logFile)
+		if err != nil {
+			return err
+		}
+		logPath = abs
+		lf, err := newRotatingLog(logPath)
 		if err != nil {
 			return err
 		}
 		defer lf.Close()
 		logOut = lf
 	}
-	logger := log.New(logOut, "", log.LstdFlags)
+	// Microseconds let pool report tell which jobs overlapped.
+	logger := log.New(logOut, "", log.LstdFlags|log.Lmicroseconds)
 	if err := containChildren(); err != nil {
 		logger.Printf("warning: jobs may outlive the agent if it is killed: %v", err)
 	}
@@ -82,7 +92,25 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 		cacheDir = filepath.Join(filepath.Dir(filepath.Clean(*f.workDir)), "cache")
 	}
 	sampler := sysinfo.NewSampler()
+	// Telling the agent's own jobs apart from the owner's work keeps the
+	// busy threshold from pausing the agent because of its own jobs.
+	if read := ownCPUReader(); read != nil {
+		sampler.SetOwnReader(read)
+	} else {
+		logger.Printf("warning: can't tell this agent's jobs from other programs; the busy threshold counts both")
+	}
 	go sampler.Run(ctx, 2*time.Second)
+
+	// Other devices use these to weigh this one; pool setup saves the
+	// measurement, and an agent without one simply doesn't report it.
+	specs := hwinfo.Detect()
+	measured, err := capacity.Load(capacity.DefaultPath())
+	if err != nil {
+		measured = nil
+		if !errors.Is(err, os.ErrNotExist) {
+			logger.Printf("not reporting measured speed: %v", err)
+		}
+	}
 
 	var a *agent.Agent
 	for {
@@ -112,6 +140,10 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 				BusyThreshold: *f.busyThreshold,
 				CacheDir:      cacheDir,
 				CacheBytes:    *f.cacheMB << 20,
+				JobMemoryMB:   *f.jobMemory,
+				Specs:         &specs,
+				Capacity:      measured,
+				LogPath:       logPath,
 			})
 			if err != nil {
 				return err
@@ -121,6 +153,10 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 				proto.Version, st.Self.Name, st.SelfLogin, strings.Join(auth.Allowed(), ", "), *f.maxJobs)
 			logger.Printf("policy: lend on battery=%v; refuse new jobs at >= %.0f%% CPU; power now: %s",
 				*f.lendOnBattery, *f.busyThreshold, describePower(pw.HasBattery, pw.OnBattery, pw.BatteryPct))
+			if m := sampler.Snapshot().Memory; m.Known {
+				logger.Printf("memory: %.1f of %.1f GB free; planning %d MB per job until jobs are measured; fewer jobs while other programs use the CPU or memory runs short",
+					float64(m.FreeMB)/1024, float64(m.TotalMB)/1024, *f.jobMemory)
+			}
 		}
 
 		addr, boundIP := *f.listen, ""
@@ -298,18 +334,32 @@ func (l *rotatingLog) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.size+int64(len(p)) > maxLogBytes {
-		l.f.Close()
-		_ = os.Remove(l.path + ".1")
-		_ = os.Rename(l.path, l.path+".1")
-		f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-		if err != nil {
+		if err := l.rotate(); err != nil {
 			return 0, err
 		}
-		l.f, l.size = f, 0
 	}
 	n, err := l.f.Write(p)
 	l.size += int64(n)
 	return n, err
+}
+
+// rotate moves the log to path.1 and starts a new one. On Windows the rename
+// fails while another program reads the log (pool report does); the log then
+// keeps growing and rotation is tried again on the next write, rather than
+// emptying the file in place.
+func (l *rotatingLog) rotate() error {
+	l.f.Close()
+	_ = os.Remove(l.path + ".1")
+	renamed := os.Rename(l.path, l.path+".1") == nil
+	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	l.f = f
+	if renamed {
+		l.size = 0
+	}
+	return nil
 }
 
 func (l *rotatingLog) Close() error {
@@ -328,4 +378,10 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	case <-ctx.Done():
 		return false
 	}
+}
+
+// defaultAgentLog is the standard place for an agent's log: next to the
+// saved measurement, which on Windows is where pool install logs too.
+func defaultAgentLog() string {
+	return filepath.Join(filepath.Dir(capacity.DefaultPath()), "agent.log")
 }
