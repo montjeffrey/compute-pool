@@ -115,6 +115,38 @@ unsigned programs that were just shipped to a device ("An Application Control
 policy has blocked this file"). Shipping scripts to an installed interpreter
 (`--ship job.py -- python job.py`) avoids this.
 
+### Running pool with Smart App Control on
+
+Smart App Control has no allow list, and pool's binaries aren't signed by a
+publicly trusted certificate yet, so Windows can block `pool.exe` itself, even
+an agent that already runs (it is blocked the next time it starts).
+`scripts/appcontrol/` sets up your own allow list: sign your pool builds with
+a certificate only you hold, and add an App Control policy that keeps Smart
+App Control's rules and also trusts that certificate.
+
+1. `pwsh scripts/appcontrol/new-cert.ps1` creates a code-signing certificate in
+   your user store (the private key can't be exported) and saves its public
+   part. It isn't added to trusted roots; only the policy trusts it.
+2. `build-policy.ps1 -CertificatePath pool-signing.cer -OutDir out` builds the
+   policy from Windows' Smart App Control template, in audit and enforced
+   versions. It needs Windows Pro, Enterprise or Education; on Home, run it on
+   another of your PCs and copy the `.cip` files back.
+3. `pwsh scripts/appcontrol/sign.ps1 bin\pool.exe` before every `pool install`.
+4. From an elevated PowerShell, `deploy-policy.ps1 compute-pool-audit.cip`.
+   Then `check-audit.ps1` shows App Control's decisions: an unsigned
+   `pool.exe` gets "would block (audit)" from "compute-pool allow list", a
+   signed one doesn't.
+
+On a Windows 11 desktop (build 26300) this was enough: with the audit policy
+deployed and Smart App Control still on, signed builds started (including the
+agent, relaunched by its task) and unsigned ones stayed blocked. Microsoft
+doesn't document that, so if signed builds are still blocked for you, turn
+Smart App Control off (it can be turned back on since the April 2026 update)
+and deploy `compute-pool-enforce.cip` instead. `deploy-policy.ps1 -Remove
+compute-pool-policy.xml` removes the policy. Any administrator can remove an
+unsigned policy like this one, and only programs signed with your certificate
+gain trust.
+
 ### Assessing real use (`pool report`)
 
 `pool report` reads every device's agent log (fetched from its agent, or
