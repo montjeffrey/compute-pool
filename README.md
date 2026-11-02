@@ -1,5 +1,7 @@
 # compute-pool
 
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/montjeffrey/compute-pool/badge)](https://scorecard.dev/viewer/?uri=github.com/montjeffrey/compute-pool)
+
 Share CPU between your own devices over Tailscale. Each device runs an agent;
 any allowed device can send it a command and get the output streamed back.
 
