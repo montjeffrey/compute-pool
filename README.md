@@ -4,7 +4,7 @@ Share CPU between your own devices over Tailscale. Each device runs an agent;
 any allowed device can send it a command and get the output streamed back.
 
 ```
-pool agent --allow desktop,laptop        # on each device that lends CPU
+pool agent --allow desktop               # on each worker; allow only where you submit from
 pool nodes                               # load, power and status of every device
 pool run -- go test ./...                # run on the least-loaded device
 pool run --node laptop -- go test ./...  # or pick the device yourself
@@ -37,10 +37,10 @@ binary was built by this repository's release workflow. Check it with the
 GitHub CLI:
 
 ```bash
-gh attestation verify pool-0.2.0-windows-amd64.exe --repo montjeffrey/compute-pool
+gh attestation verify pool-0.1.4-windows-amd64.exe --repo montjeffrey/compute-pool
 ```
 
-Commits and release tags are signed, and show as **Verified** on GitHub.
+Release tags from v0.1.1 on are signed, and show as **Verified** on GitHub.
 
 ## Splitting work with `pool map`
 
@@ -74,8 +74,9 @@ Choose the items with exactly one of:
   A shipped program runs as a hard link to its cached copy, which is
   re-verified before each use, so antivirus scans it once rather than once per
   task (Windows Defender adds about half a second to each new copy of a
-  program). Other shipped files are copied, so a task can't change another
-  task's input.
+  program). Other shipped files are copied, so a task that writes to its input
+  doesn't change the cached copy. Running tasks share an account, though; see
+  [SECURITY.md](SECURITY.md#known-limits).
 
 Paths are checked on both sides: inputs and collected files can't use `..`,
 absolute paths, drive letters, Windows device names (`CON`, `NUL`, …) or
@@ -163,6 +164,65 @@ layers:
 
 [SECURITY.md](SECURITY.md) has the full threat model, the known limits, and how
 to report a vulnerability.
+
+## Secure deployment
+
+An allowed device can run anything on an agent, so most of the work is keeping
+that set small and the agent's reach narrow.
+
+1. **Verify what you install.** Check the binary against `SHA256SUMS` and its
+   build provenance (see [Install](#install)):
+   ```bash
+   gh attestation verify pool-0.1.4-windows-amd64.exe --repo montjeffrey/compute-pool
+   ```
+2. **Point allow lists one way.** Workers allow only the machines that submit
+   jobs, never each other. A job counts as its own device to every other agent,
+   so two agents that allow each other share whatever reaches either one.
+3. **Lend machines where the agent's account has little to lose.** The agent
+   and its jobs run as the user the agent runs as (on Windows, whoever ran
+   `pool install`) and can read that user's files, credentials and
+   environment. Identity is per device, so don't run an agent, or name a device
+   in `--allow`, where people you don't trust are logged on: their processes
+   count as that device. On Windows, run `pool install` from an **elevated**
+   shell logged on as the account the agent should run as, so the agent runs
+   at startup, outside your desktop session, from that account's own folder.
+4. **Replace your tailnet's default allow-all policy.** A new tailnet lets every
+   device reach every port. This ACL rule, also in the [hardening
+   checklist](SECURITY.md#hardening-checklist), limits port 7470 to your own
+   devices:
+   ```json
+   {"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:7470"]}
+   ```
+   If all your devices sign in as one user, that still opens 7470 on every one
+   of them. To open it only on the workers, name devices by their tailnet IP and
+   use grants, with a `tests` block so the policy editor refuses a change that
+   breaks it:
+   ```json
+   {
+     "hosts": {
+       "workstation": "100.64.0.1",
+       "worker": "100.64.0.2"
+     },
+     "grants": [
+       { "src": ["workstation"], "dst": ["worker"], "ip": ["tcp:7470"] }
+     ],
+     "tests": [
+       { "src": "workstation", "accept": ["worker:7470"] },
+       { "src": "worker", "deny": ["workstation:7470"] }
+     ]
+   }
+   ```
+   Replace the addresses with your devices' (`tailscale ip -4`), and keep any
+   other grants you rely on: once allow-all is gone, anything not granted is
+   blocked.
+5. **Harden the tailnet itself.** Turn on
+   [Tailnet Lock](https://tailscale.com/kb/1226/tailnet-lock) and device
+   approval, leave key expiry on, and use MFA on the identity provider you sign
+   in to Tailscale with. Whoever controls that account can add a device that
+   passes every check.
+6. **Pass secrets with `--env`,** never as arguments, which are logged and shown
+   on the dashboard. Jobs running at the same time can still read each other's
+   environment.
 
 ## Build
 
