@@ -35,7 +35,7 @@ Who it defends against, and where that defense stops today:
 | Hostile code inside a legitimate job (a poisoned dependency, say) | Jobs run in a fresh scratch folder at below-normal priority | Same account as the agent, so it can reach everything that account can; see "Known limits" for the cache, other jobs' folders, the agent's program and log, leftover processes and other agents |
 | Another local user, on the agent's machine or on any device in `--allow` | Nothing yet | Identity is per device: any process on an allowed device is that device, and the agent's own device is always allowed |
 | A web page open in a browser on any device | `Origin`, `Sec-Fetch-Site`, JSON content type and `Host` checks | — |
-| A compromised dependency, GitHub Action or release workflow | Actions pinned to commit SHAs, secret scanning and `govulncheck` in CI (not run by the release workflow), build provenance on releases | Branch and tag protection, signed binaries and an SBOM are planned |
+| A compromised dependency, GitHub Action or release workflow | Actions pinned to commit SHAs; in CI (not in the release workflow): `go mod verify`, `govulncheck`, secret scanning and workflow linting (zizmor); CodeQL and OpenSSF Scorecard reports in code scanning; Dependabot waits 7 days before proposing a new release; build provenance on releases | Branch and tag protection, signed binaries and an SBOM are planned. There is one maintainer, so no change is reviewed by a second person (Scorecard's Code-Review check stays low) |
 | A compromised agent, seen from the client | Returned files are checked as hostile (below) | Output is printed as received |
 
 Out of scope: an administrator on the agent's machine, physical access, and a

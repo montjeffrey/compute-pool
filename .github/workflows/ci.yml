@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, so a new advisory against the pinned toolchain or a dependency
+  # turns govulncheck red even when nothing else changes.
+  schedule:
+    - cron: "23 5 * * 1"
 
 permissions:
   contents: read
@@ -17,9 +21,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The toolchain comes from go.mod's toolchain line, so CI, releases and
+      # local builds use the same Go.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: stable
+          go-version-file: go.mod
+      - name: Verify module checksums
+        run: go mod verify
       - name: Check formatting
         if: runner.os == 'Linux'
         run: |
@@ -36,14 +46,22 @@ jobs:
       - name: Build release binary
         run: go build -trimpath -o pool-bin ./cmd/pool
 
+  # govulncheck is built from source at a pinned version, like gitleaks below,
+  # so Go's checksum database vouches for it. It reads the vulnerability
+  # database live; only the tool is pinned. `go run pkg@version` would build it
+  # with the oldest Go its module allows, which can't parse a newer standard
+  # library, so GOTOOLCHAIN makes it use this module's toolchain.
   vulncheck:
     runs-on: ubuntu-latest
     steps:
-      # The Go team's action installs a govulncheck that understands the
-      # current Go release; an old pinned binary can't parse newer code.
-      - uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          go-version-input: stable
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: govulncheck
+        run: GOTOOLCHAIN="$(go env GOVERSION)" go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
   # Every commit, not just the tip: a secret removed later is still in history.
   # gitleaks is built from source at a pinned version, so Go's checksum
@@ -55,8 +73,24 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: stable
+          go-version-file: go.mod
       - name: gitleaks
         run: go run github.com/zricethezav/gitleaks/v8@v8.30.1 git --redact --no-banner .
+
+  # Static analysis of these workflow files: unpinned actions, template
+  # injection, leaked credentials, overly broad permissions and the like.
+  # pipx (preinstalled on GitHub's Ubuntu runners) runs a pinned release.
+  workflows:
+    name: workflow lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pipx run zizmor==1.31.1 --format github .github
