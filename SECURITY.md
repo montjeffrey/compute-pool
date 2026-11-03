@@ -101,7 +101,10 @@ Release binaries are built by the release workflow from the tagged commit, with
   unsigned, and signing isn't enforced).
 
 Binaries are **not code-signed yet**. On Windows, Smart App Control may refuse
-to run them, and SmartScreen may warn.
+to run them, and SmartScreen may warn. `scripts/appcontrol/` lets you sign
+builds yourself and trust them with an App Control policy (README,
+"Application control"); anything running as the signing account can use that
+key, so keep that account for signing only.
 
 ## Known limits
 

@@ -32,7 +32,8 @@ your `PATH`. Release binaries are built by GitHub Actions from the tagged
 commit. They aren't code-signed yet, so Windows may warn before running them, and
 on a PC with Smart App Control turned on it may refuse to run them at all.
 Smart App Control judges each file separately, so one release can run while the
-next is blocked.
+next is blocked. [Application control](#application-control-windows) covers
+signing your own builds and trusting them with an App Control policy.
 
 Releases after v0.1.0 also carry build provenance: a signed record that each
 binary was built by this repository's release workflow. Check it with the
@@ -277,6 +278,61 @@ object tied to the agent, so if the agent is stopped or crashes, its jobs end to
 
 On Linux or macOS, run `pool agent --log-file ...` from a systemd user service or
 a launchd agent; `pool install` is Windows-only so far.
+
+### Application control (Windows)
+
+Smart App Control has no exceptions, and pool's binaries aren't signed by a
+publicly trusted certificate, so it can block `pool.exe`, including an agent
+that already runs (it is blocked the next time it starts). `scripts/appcontrol/`
+sets up your own allow list instead: sign your pool builds with a certificate
+only you hold, and deploy an App Control for Business policy that trusts it.
+
+The policy doesn't add an exception to Smart App Control. It is built from
+Microsoft's Smart App Control template, so it keeps the same rules (Windows,
+reputable and publicly signed code) and adds your certificate, but Windows runs
+a program only if every enforced policy allows it. The documented path is to
+turn Smart App Control off and let the policy take its place. That is a
+Windows security setting, so it is your decision; since the April 2026 update
+(KB5083769) Smart App Control can be turned back on, and removing the policy
+and turning it back on restores the original state. (One Windows 11 desktop,
+build 26300, also ran signed builds with the audit policy deployed and Smart
+App Control still on. Microsoft doesn't document that, so don't rely on it.)
+
+1. **Certificate.** Under a local account that runs nothing else (never the
+   account the agent runs as), run
+   `pwsh scripts/appcontrol/new-cert.ps1 -Subject 'CN=Your Name' -RequireTpm`.
+   The key is made in the TPM, so it can't be copied off the device, but
+   anything running as that account can sign with it. The certificate isn't
+   added to trusted roots; only the policy trusts it. It prints the thumbprint
+   and where it saved the public part (`.cer`).
+2. **Policy.** `pwsh scripts/appcontrol/build-policy.ps1 -CertificatePath <.cer> -OutDir out`
+   writes `compute-pool-policy.xml` and an audit and an enforced `.cip`. It
+   needs Windows Pro, Enterprise or Education; on Home, build it on another PC
+   and copy the folder.
+3. **Sign** every build before you install it, from the signing account:
+   `pwsh scripts/appcontrol/sign.ps1 pool.exe -ExpectedSha256 <hash> -TimestampServer http://timestamp.digicert.com`.
+   The hash is the one from `SHA256SUMS` or your own build, so a file swapped
+   in between doesn't get your signature.
+4. **Audit**, from an elevated PowerShell:
+   `scripts/appcontrol/deploy-policy.ps1 out\compute-pool-audit.cip`. It blocks
+   nothing and logs what it would block. Run your signed `pool.exe`, and the
+   programs your jobs use.
+5. **Check:** `pwsh scripts/appcontrol/check-audit.ps1 -Since '<time printed in step 4>'`
+   lists App Control's decisions about matching files, with the signer Windows
+   saw, and exits 1 if there are any. A signed `pool.exe` should have none; an
+   unsigned one gets "would block (audit)".
+6. **Enforce:** `scripts/appcontrol/deploy-policy.ps1 out\compute-pool-enforce.cip -Program pool.exe`.
+   It refuses unless the same policy is active in audit mode, `-Program` is
+   signed by your certificate, and step 5 finds nothing since the audit policy
+   went in. No events can also mean the program never ran, so run it in step 4.
+   It prints the command that removes the policy:
+   `deploy-policy.ps1 -Remove out\compute-pool-policy.xml`.
+
+Programs that jobs ship (`--ship`, `poolbench`) are checked too, and unsigned
+ones are blocked; sign them, or ship scripts to an installed interpreter. The
+policy is unsigned, so any administrator can remove it. A signed policy resists
+that, but a mistake with one can leave Windows unable to boot, so these scripts
+don't make one.
 
 ### Dashboard (`pool dashboard`)
 

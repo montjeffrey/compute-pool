@@ -17,16 +17,26 @@
 param(
     [Parameter(Mandatory)][string]$CertificatePath,
     [string]$OutDir = '.',
-    [string]$PolicyName = 'compute-pool allow list'
+    [string]$PolicyName = 'compute-pool allow list',
+    [string]$TemplatePath = (Join-Path $env:windir 'schemas\CodeIntegrity\ExamplePolicies\SmartAppControl.xml')
 )
 $ErrorActionPreference = 'Stop'
 Import-Module ConfigCI
 
-$template = Join-Path $env:windir 'schemas\CodeIntegrity\ExamplePolicies\SmartAppControl.xml'
-if (-not (Test-Path $template)) { throw "template not found: $template" }
+$cerFile = (Resolve-Path $CertificatePath).Path
+$cert = [Security.Cryptography.X509Certificates.X509Certificate2]::new($cerFile)
+# App Control signer rules work with RSA keys only, and the certificate must
+# be one Windows will accept for code signing.
+if ($cert.PublicKey.Oid.Value -ne '1.2.840.113549.1.1.1') { throw "$cerFile is not an RSA certificate; App Control signer rules need RSA" }
+$ekus = @($cert.Extensions | Where-Object { $_ -is [Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] } |
+    ForEach-Object { $_.EnhancedKeyUsages } | ForEach-Object Value)
+if ($ekus -notcontains '1.3.6.1.5.5.7.3.3') { throw "$cerFile has no code-signing usage (1.3.6.1.5.5.7.3.3)" }
+if ($cert.NotAfter -lt (Get-Date)) { throw "$cerFile expired on $($cert.NotAfter.ToString('yyyy-MM-dd'))" }
+
+if (-not (Test-Path $TemplatePath)) { throw "template not found: $TemplatePath" }
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 $xml = Join-Path (Resolve-Path $OutDir) 'compute-pool-policy.xml'
-Copy-Item $template $xml -Force
+Copy-Item $TemplatePath $xml -Force
 
 # The template carries one option only Smart App Control itself may use;
 # Microsoft says it must be removed from policies built from it.
@@ -35,13 +45,15 @@ Copy-Item $template $xml -Force
     ForEach-Object { [void]$_.ParentNode.RemoveChild($_) }
 $doc.Save($xml)
 
-# A new policy ID, so this policy sits beside Windows' own instead of
-# replacing one of them.
+# A new policy ID makes this a base policy of its own. It doesn't extend
+# Smart App Control: Windows runs a program only if every enforced policy
+# allows it, so while Smart App Control is on it still blocks what it
+# blocked before. Turned off, this policy takes its place.
 Set-CIPolicyIdInfo -FilePath $xml -PolicyName $PolicyName -ResetPolicyID | Out-Null
 Set-CIPolicyVersion -FilePath $xml -Version '1.0.0.0'
 # Trust user-mode code signed with the certificate. Only this rule widens
 # Smart App Control's circle of trust.
-Add-SignerRule -FilePath $xml -CertificatePath (Resolve-Path $CertificatePath) -User
+Add-SignerRule -FilePath $xml -CertificatePath $cerFile -User
 # Unsigned policy (6) that can be updated without a reboot (16).
 Set-RuleOption -FilePath $xml -Option 6
 Set-RuleOption -FilePath $xml -Option 16
@@ -52,6 +64,14 @@ Set-RuleOption -FilePath $xml -Option 3 # Enabled:Audit Mode
 ConvertFrom-CIPolicy -XmlFilePath $xml -BinaryFilePath (Join-Path $OutDir 'compute-pool-audit.cip') | Out-Null
 
 [xml]$p = Get-Content $xml
+$name = $cert.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+$ours = @($p.SiPolicy.Signers.Signer | Where-Object Name -eq $name)
+if ($ours.Count -ne 1) { throw "expected one signer named '$name' in $xml, found $($ours.Count)" }
 "Policy ID: $($p.SiPolicy.PolicyID)"
 "Options:   " + (($p.SiPolicy.Rules.Rule | ForEach-Object Option) -join ', ')
-"Signers:   " + (($p.SiPolicy.Signers.Signer | ForEach-Object Name) -join ', ')
+""
+"Trusted, besides what the template allows: user-mode code signed by"
+"  $($cert.Subject) (thumbprint $($cert.Thumbprint), until $($cert.NotAfter.ToString('yyyy-MM-dd')))"
+"Not trusted: anything else that is unsigned and unknown to Microsoft's"
+"  cloud, including programs jobs ship with --ship unless you sign them too."
+"The policy is unsigned, so any administrator can remove it."
