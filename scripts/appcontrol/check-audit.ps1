@@ -22,7 +22,9 @@
 param(
     [string]$Match = 'pool',
     [datetime]$Since = (Get-Date).AddHours(-1),
-    [guid]$PolicyId
+    # Nullable: a plain [guid] would default to Guid.Empty, which PowerShell
+    # treats as true, and drop every event that names a policy.
+    [Nullable[guid]]$PolicyId
 )
 $ErrorActionPreference = 'Stop'
 $logs = @(
@@ -68,7 +70,7 @@ $rows = foreach ($log in $logs) {
         # Without a known file field, match any value the event carries.
         $haystack = if ($file) { $file } else { $f.Values -join ' ' }
         $eventPolicy = $f['PolicyGUID'] -as [guid]
-        if ($PolicyId -and $eventPolicy) {
+        if ($null -ne $PolicyId -and $eventPolicy) {
             if ($eventPolicy -ne $PolicyId) { continue }
         } elseif ($haystack -notmatch $Match) { continue }
         [pscustomobject]@{

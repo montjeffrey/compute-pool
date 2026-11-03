@@ -9,24 +9,28 @@
 # extract (-RequireTpm refuses instead). Neither stops the key being *used*:
 # anything that runs as this account can sign code the policy will trust.
 # So create it under an account that runs nothing else, and never under the
-# account the agent runs as. An existing certificate is reused only if it is
-# the only one with that subject and its key can't be exported.
+# account the agent runs as.
 #
-#   pwsh scripts/appcontrol/new-cert.ps1 -Subject 'CN=Your Name' [-RequireTpm] [-OutFile pool-signing.cer]
+# If a certificate with the subject already exists, it is reused only when
+# you name it with -Thumbprint (the one this script printed when it made
+# it): nothing can prove where an existing key came from.
+#
+#   pwsh scripts/appcontrol/new-cert.ps1 -Subject 'CN=Your Name' [-RequireTpm] [-OutFile pool-signing.cer] [-Thumbprint <to reuse>]
 param(
     [string]$Subject = "CN=compute-pool code signing ($($env:COMPUTERNAME.ToLower()))",
     [string]$OutFile = (Join-Path $env:LOCALAPPDATA 'compute-pool\signing\pool-signing.cer'),
     [int]$Years = 2,
-    [switch]$RequireTpm
+    [switch]$RequireTpm,
+    [string]$Thumbprint
 )
 $ErrorActionPreference = 'Stop'
 $found = @(Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Where-Object Subject -eq $Subject)
-if ($found.Count -gt 1) {
-    throw "$($found.Count) certificates are named '$Subject' ($($found.Thumbprint -join ', ')); remove the ones you didn't make, or pick another -Subject"
-}
-$cert = $found[0]
-if ($cert) {
-    "Reusing the existing certificate for '$Subject'."
+if ($Thumbprint) {
+    $cert = $found | Where-Object Thumbprint -eq $Thumbprint
+    if (-not $cert) { throw "no code-signing certificate '$Subject' with thumbprint $Thumbprint in your store" }
+    "Reusing the certificate $Thumbprint."
+} elseif ($found) {
+    throw "a certificate named '$Subject' already exists ($($found.Thumbprint -join ', ')); pass -Thumbprint to reuse one you made, or pick another -Subject"
 } else {
     # App Control signer rules need RSA, not ECC. TPMs reliably support RSA
     # 2048; many refuse 3072.

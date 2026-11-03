@@ -57,21 +57,18 @@ Describe 'new-cert.ps1' {
         ($cert.NotAfter - (Get-Date)).TotalDays | Should -BeLessThan 735
         $cer | Should -Exist
     }
-    It 'reuses the certificate on a second run' {
-        & "$dir\new-cert.ps1" -Subject $subject -OutFile $cer -WarningAction SilentlyContinue | Out-Null
+    It 'reuses the certificate when named by thumbprint' {
+        & "$dir\new-cert.ps1" -Subject $subject -OutFile $cer -Thumbprint $cert.Thumbprint -WarningAction SilentlyContinue | Out-Null
         @(Get-ChildItem Cert:\CurrentUser\My | Where-Object Subject -eq $subject).Count | Should -Be 1
     }
-    It 'refuses when two certificates have the subject' {
-        $twin = New-TestCert $subject
-        try {
-            { & "$dir\new-cert.ps1" -Subject $subject -OutFile (Join-Path $TestDrive 'x.cer') } | Should -Throw '*2 certificates*'
-        } finally { Remove-Item "Cert:\CurrentUser\My\$($twin.Thumbprint)" -DeleteKey }
+    It 'refuses an existing subject without -Thumbprint' {
+        { & "$dir\new-cert.ps1" -Subject $subject -OutFile (Join-Path $TestDrive 'x.cer') } | Should -Throw '*already exists*'
     }
     It 'refuses to reuse a certificate whose key can be exported' {
         $name = "CN=compute-pool test exportable $([guid]::NewGuid().ToString('N').Substring(0, 6))"
         $planted = New-SelfSignedCertificate -Type CodeSigningCert -Subject $name -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable
         try {
-            { & "$dir\new-cert.ps1" -Subject $name -OutFile (Join-Path $TestDrive 'x.cer') } | Should -Throw '*can be exported*'
+            { & "$dir\new-cert.ps1" -Subject $name -OutFile (Join-Path $TestDrive 'x.cer') -Thumbprint $planted.Thumbprint } | Should -Throw '*can be exported*'
         } finally { Remove-Item "Cert:\CurrentUser\My\$($planted.Thumbprint)" -DeleteKey }
     }
     It 'with -RequireTpm, fails instead of falling back to a software key' {
@@ -109,6 +106,18 @@ Describe 'sign.ps1' {
         $twin = New-TestCert $subject
         try { { & "$dir\sign.ps1" $exe -Subject $subject } | Should -Throw '*pick one with -Thumbprint*' }
         finally { Remove-Item "Cert:\CurrentUser\My\$($twin.Thumbprint)" -DeleteKey }
+    }
+    It "gives the signed file its folder's permissions" {
+        $shared = New-Item -ItemType Directory (Join-Path $TestDrive "shared$([guid]::NewGuid().ToString('N').Substring(0, 6))")
+        $everyone = [Security.Principal.SecurityIdentifier]'S-1-1-0'
+        $acl = [IO.FileSystemAclExtensions]::GetAccessControl($shared, [Security.AccessControl.AccessControlSections]::Access)
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($everyone, 'ReadAndExecute', 'ObjectInherit', 'None', 'Allow'))
+        [IO.FileSystemAclExtensions]::SetAccessControl($shared, $acl)
+        $there = Join-Path $shared 'pool.exe'
+        Copy-Item $unsigned $there
+        & "$dir\sign.ps1" $there -Thumbprint $cert.Thumbprint | Out-Null
+        $inherited = @((Get-Acl $there).Access | Where-Object { $_.IsInherited -and $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]) -eq $everyone })
+        $inherited.Count | Should -Be 1
     }
     It 'replaces a hard-linked file instead of writing through the link' {
         $other = Join-Path $TestDrive "link$([guid]::NewGuid().ToString('N').Substring(0, 6)).exe"
@@ -183,6 +192,10 @@ Describe 'check-audit.ps1' {
         Mock Get-WinEvent { Get-FakeLog $Oldest $FilterHashtable (New-FakeEvent 3033 @{ FileNameBuffer = '\Device\HarddiskVolume3\x\pool.exe' }) }
         Invoke-Check | Should -Be 1
     }
+    It 'without -PolicyId, still counts events that name a policy' {
+        Mock Get-WinEvent { Get-FakeLog $Oldest $FilterHashtable (New-FakeEvent 3076 @{ 'File Name' = '\x\pool.exe'; PolicyGUID = "{$([guid]::NewGuid())}" }) }
+        Invoke-Check | Should -Be 1
+    }
     It 'with -PolicyId, counts any file that policy would block' {
         Mock Get-WinEvent { Get-FakeLog $Oldest $FilterHashtable (New-FakeEvent 3076 @{ 'File Name' = '\x\node.exe'; PolicyGUID = "{$ours}" }) }
         Invoke-Check @{ PolicyId = $ours } | Should -Be 1
@@ -212,7 +225,21 @@ Describe 'deploy-policy.ps1' {
         # copy of each policy it is given, and lists $listing as JSON.
         $d = Join-Path $TestDrive 'deploy'
         New-Item -ItemType Directory $d | Out-Null
-        (Get-Content "$dir\deploy-policy.ps1") -notmatch '^#Requires -RunAsAdministrator' | Set-Content "$d\deploy-policy.ps1"
+        # The work folder grants only SYSTEM and Administrators, which an
+        # unelevated test can't use, so the copy also grants the test user.
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $patch = @{
+            '^\$workOwners = .*'   = "`$workOwners = 'S-1-5-18', 'S-1-5-32-544', '$me'"
+            '^\$workSddl = .*'     = "`$workSddl = 'D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;$me)'"
+            '^\$workSections = .*' = "`$workSections = 'Access'"
+        }
+        $lines = (Get-Content "$dir\deploy-policy.ps1") -notmatch '^#Requires -RunAsAdministrator' | ForEach-Object {
+            $line = $_
+            foreach ($k in $patch.Keys) { if ($line -match $k) { $line = $patch[$k] } }
+            $line
+        }
+        @($lines | Where-Object { $_ -like "*;;;$me)'" }).Count | Should -Be 1
+        $lines | Set-Content "$d\deploy-policy.ps1"
         Copy-Item "$dir\check-audit.ps1" $d
         $calls = Join-Path $TestDrive 'citool-calls.txt'
         $listing = Join-Path $TestDrive 'citool-listing.json'
@@ -266,8 +293,19 @@ exit 0
     It 'deploys exactly the audit build, records it, and prints the rollback' {
         $out = Deploy @{ Mode = 'audit' }
         ($out -join "`n") | Should -BeLike "*To undo:*-Remove*CiTool --remove-policy $policyId*"
+        ($out -join "`n") | Should -BeLike "*Signers it trusts beyond the template:*$($subject -replace '^CN=')*"
         (Get-ItemProperty $record).Mode | Should -Be 'audit'
         (Get-FileHash $deployed).Hash | Should -Be (Get-FileHash (Join-Path $policyDir 'compute-pool-audit.cip')).Hash
+    }
+    It 'refuses enforce when the policy XML changed since the audit deployment' {
+        $changed = Join-Path $TestDrive 'changed.xml'
+        (Get-Content $policyXml -Raw) -replace '<VersionEx>[^<]*</VersionEx>', '<VersionEx>1.0.0.1</VersionEx>' | Set-Content $changed
+        { Deploy @{ Mode = 'enforce'; Program = $signed } $changed } | Should -Throw '*changed since*'
+    }
+    It 'refuses to remove a policy it did not deploy' {
+        $other = Join-Path $TestDrive 'other.xml'
+        (Get-Content $policyXml -Raw) -replace [regex]::Escape($policyId), "{$([guid]::NewGuid().ToString().ToUpper())}" | Set-Content $other
+        { Deploy @{ Remove = $true } $other } | Should -Throw "*didn't deploy*"
     }
     It 'refuses enforce without -Program' {
         { Deploy @{ Mode = 'enforce' } } | Should -Throw '*-Program*'
@@ -309,6 +347,19 @@ exit 0
         Deploy @{ Remove = $true } | Out-Null
         Get-Content $calls | Should -Contain "--remove-policy $policyId"
         Test-Path $record | Should -BeFalse
+    }
+    It 'run elevated and unchanged, locks its work folder to SYSTEM and Administrators' {
+        $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrators')
+        if (-not $elevated) { Set-ItResult -Skipped -Because 'needs an elevated shell (CI runs elevated)'; return }
+        $root = Join-Path $TestDrive 'admin-work'
+        $realKey = "$key-real"
+        try {
+            & "$dir\deploy-policy.ps1" $policyXml -Mode audit -CiTool $common.CiTool -StateKey $realKey -WorkRoot $root | Out-Null
+            $sd = [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($root), 'Owner, Access')
+            $sd.GetOwner([Security.Principal.SecurityIdentifier]).Value | Should -Be 'S-1-5-32-544'
+            @($sd.Access | ForEach-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } | Sort-Object -Unique) |
+                Should -Be @('S-1-5-18', 'S-1-5-32-544')
+        } finally { if (Test-Path $realKey) { Remove-Item $realKey -Recurse } }
     }
     It 'leaves no work folders behind' {
         @(Get-ChildItem (Join-Path $TestDrive 'work')).Count | Should -Be 0

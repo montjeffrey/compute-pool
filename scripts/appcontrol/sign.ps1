@@ -4,7 +4,7 @@
 # pool.exe is blocked like any unknown program.
 #
 # Each file is copied into a new folder in your own temp directory, and the
-# copy is hashed, signed and checked there, then moved over the original.
+# copy is hashed, signed and checked there, then put in place of the original.
 # -ExpectedSha256 refuses a file whose bytes aren't the ones you meant (the
 # hash from SHA256SUMS or your own build), and because the copy is what gets
 # hashed and signed, the file can't be swapped in between. -TimestampServer
@@ -55,9 +55,12 @@ for ($i = 0; $i -lt $Path.Count; $i++) {
         }
         if ($check.Status -notin 'Valid', 'UnknownError') { throw "signature on $p is $($check.Status): $($check.StatusMessage)" }
         if ($TimestampServer -and -not $check.TimeStamperCertificate) { throw "signature on $p has no timestamp" }
-        # Replace the original instead of writing into it, so a hard link at
-        # $p doesn't carry the change to another file.
-        Move-Item -LiteralPath $copy -Destination $p -Force
+        # Replace the original with a new file instead of writing into it, so
+        # a hard link at $p doesn't carry the change to another file, and the
+        # file takes its folder's permissions, not those of your temp folder.
+        # Copy refuses if something was created at $p in between.
+        Remove-Item -LiteralPath $p
+        [IO.File]::Copy($copy, $p, $false)
         "signed $p"
     } finally {
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue

@@ -9,7 +9,11 @@
 #   check-audit.ps1 -Since <time printed in step 1>               # 2. nothing would be blocked
 #   deploy-policy.ps1 out\compute-pool-policy.xml -Mode enforce -Program bin\pool.exe
 #                                                                 # 3. replaces the audit one
-#   deploy-policy.ps1 out\compute-pool-policy.xml -Remove
+#   deploy-policy.ps1 out\compute-pool-policy.xml -Remove        # only a policy this script deployed
+#
+# The audit deployment records the SHA-256 of the XML, and enforce refuses if
+# it changed since, so the policy can't gain rules in between. Every
+# deployment prints the policy's options and the signers it adds.
 #
 # It copies the XML into a new folder only administrators can write, checks
 # it there, builds the .cip from that copy in the mode you asked for, and
@@ -49,22 +53,27 @@ function Get-TbsHash([Security.Cryptography.X509Certificates.X509Certificate2]$C
     [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($tbs))
 }
 
-# A new folder that only SYSTEM, Administrators and this account can write.
-# The root must not be a link, and must not belong to another account.
+# A new folder that only SYSTEM and Administrators can reach, owned by
+# Administrators. Your own unelevated programs run as you without
+# Administrators, so they can't reach it either. The root must not be a link,
+# and must not belong to anyone else.
+$workOwners = 'S-1-5-18', 'S-1-5-32-544'
+$workSddl = 'O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)'
+$workSections = 'Owner, Access'
 function New-WorkDir {
     if (Test-Path -LiteralPath $WorkRoot) {
         $root = Get-Item -LiteralPath $WorkRoot -Force
         if ($root.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$WorkRoot is a link; remove it" }
         $owner = (Get-Acl -LiteralPath $WorkRoot).GetOwner([Security.Principal.SecurityIdentifier]).Value
-        if ($owner -notin 'S-1-5-18', 'S-1-5-32-544', $me) { throw "$WorkRoot belongs to $owner; remove it" }
+        if ($owner -notin $workOwners) { throw "$WorkRoot belongs to $owner; remove it" }
     } else {
         New-Item -ItemType Directory $WorkRoot | Out-Null
     }
-    # Only the access list: Set-Acl would also write the audit list, which
-    # needs a privilege administrators don't hold by default.
+    # Owner and access list only: Set-Acl would also write the audit list,
+    # which needs a privilege administrators don't hold by default.
     $folder = [IO.DirectoryInfo]::new($WorkRoot)
     $acl = [IO.FileSystemAclExtensions]::GetAccessControl($folder, [Security.AccessControl.AccessControlSections]::Access)
-    $acl.SetSecurityDescriptorSddlForm("D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;$me)", 'Access')
+    $acl.SetSecurityDescriptorSddlForm($workSddl, $workSections)
     [IO.FileSystemAclExtensions]::SetAccessControl($folder, $acl)
     New-Item -ItemType Directory (Join-Path $WorkRoot ([guid]::NewGuid().ToString('N')))
 }
@@ -75,11 +84,14 @@ function Invoke-CiTool {
     $out
 }
 
-$me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $work = New-WorkDir
 try {
     $xml = Join-Path $work 'policy.xml'
-    [IO.File]::WriteAllText($xml, [IO.File]::ReadAllText((Resolve-Path -LiteralPath $PolicyXml).Path))
+    $bytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $PolicyXml).Path)
+    [IO.File]::WriteAllBytes($xml, $bytes)
+    # The audit deployment records this hash, and enforce requires the same
+    # one, so the policy can't gain rules between the two.
+    $policyHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
     [xml]$policy = Get-Content -LiteralPath $xml
     $g = [guid]::Empty
     if (-not [guid]::TryParse($policy.SiPolicy.PolicyID, [ref]$g)) { throw "PolicyID '$($policy.SiPolicy.PolicyID)' is not a GUID" }
@@ -90,6 +102,7 @@ try {
     $rollback = "deploy-policy.ps1 `"$((Resolve-Path -LiteralPath $PolicyXml).Path)`" -Remove   (or: CiTool --remove-policy $id)"
 
     if ($Remove) {
+        if (-not (Test-Path $record) -and -not $Force) { throw "this script didn't deploy policy $id; -Force removes it anyway" }
         Invoke-CiTool --remove-policy $id | Out-Null
         if (Test-Path $record) { Remove-Item $record -Recurse }
         "Removed $name $id."
@@ -100,6 +113,7 @@ try {
         if (-not (Test-Path $record)) { throw "deploy this policy with -Mode audit first (no audit record for $id); -Force skips this" }
         $audit = Get-ItemProperty $record
         if ($audit.Mode -ne 'audit') { throw "policy $id is already $($audit.Mode); -Force to redeploy" }
+        if ($audit.PolicySha256 -ne $policyHash) { throw "$PolicyXml changed since it was deployed in audit mode; deploy it with -Mode audit again" }
         $listed = (Invoke-CiTool --list-policies --json) -join "`n" | ConvertFrom-Json
         if (-not $listed.PSObject.Properties['Policies']) { throw "can't read CiTool's policy list; -Force skips this check" }
         if (-not @($listed.Policies | Where-Object { ("$($_.PolicyID)" -as [guid]) -eq $g })) {
@@ -129,7 +143,12 @@ try {
     New-Item -Force $record | Out-Null
     Set-ItemProperty $record -Name Mode -Value $Mode
     Set-ItemProperty $record -Name DeployedAt -Value $now.ToString('o')
+    Set-ItemProperty $record -Name PolicySha256 -Value $policyHash
     "Deployed $name $id in $Mode mode at $($now.ToLocalTime())."
+    [xml]$deployedXml = Get-Content -LiteralPath $xml
+    "Options: " + (($deployedXml.SiPolicy.Rules.Rule | ForEach-Object Option) -join ', ')
+    "Signers it trusts beyond the template:"
+    foreach ($s in $policy.SiPolicy.Signers.Signer | Where-Object { $_.ID -like 'ID_SIGNER_S_*' }) { "  $($s.Name) (TBS $($s.CertRoot.Value))" }
     if ($Mode -eq 'audit') { "Next: run your signed pool.exe, then check-audit.ps1 -Since '$($now.ToLocalTime())'." }
     "To undo: $rollback"
 } finally {
