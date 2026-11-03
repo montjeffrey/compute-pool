@@ -11,16 +11,18 @@
 # from "compute-pool allow list", and an unsigned one should.
 #
 # Exit code: 0 no matching event, 1 at least one (so it can gate a script),
-# 2 a log couldn't be read (that is not the same as "no events").
+# 2 a log couldn't be read, or no longer goes back to -Since (older events
+# were overwritten), so "no events" can't be told apart.
 #
-# -Policy keeps only events from that policy (events that name no policy,
-# like 3033, are always kept), so another product's policy doesn't count.
+# -PolicyId (the policy's GUID, from its XML) counts every event from that
+# policy, whatever the file, drops events from other policies, and keeps
+# events that name no policy (like 3033) only if they match -Match.
 #
-#   pwsh scripts/appcontrol/check-audit.ps1 [-Match pool] [-Since (Get-Date).AddHours(-1)] [-Policy 'compute-pool allow list']
+#   pwsh scripts/appcontrol/check-audit.ps1 [-Match pool] [-Since (Get-Date).AddHours(-1)] [-PolicyId <guid>]
 param(
     [string]$Match = 'pool',
     [datetime]$Since = (Get-Date).AddHours(-1),
-    [string]$Policy
+    [guid]$PolicyId
 )
 $ErrorActionPreference = 'Stop'
 $logs = @(
@@ -47,6 +49,13 @@ function Get-EventFields($e) {
 $unreadable = @()
 $rows = foreach ($log in $logs) {
     try {
+        # A full log overwrites its oldest events. If what is left starts
+        # after -Since, an empty result proves nothing.
+        $oldest = Get-WinEvent -LogName $log.LogName -MaxEvents 1 -Oldest
+        if ($oldest -and $oldest.TimeCreated -gt $Since) {
+            $unreadable += "$($log.LogName): its oldest event is from $($oldest.TimeCreated), after $Since"
+            continue
+        }
         $events = Get-WinEvent -FilterHashtable (@{ StartTime = $Since } + $log)
     } catch {
         if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { continue }
@@ -58,8 +67,10 @@ $rows = foreach ($log in $logs) {
         $file = @('File Name', 'FileNameBuffer', 'FilePath', 'FullFilePath' | ForEach-Object { $f[$_] } | Where-Object { $_ })[0]
         # Without a known file field, match any value the event carries.
         $haystack = if ($file) { $file } else { $f.Values -join ' ' }
-        if ($haystack -notmatch $Match) { continue }
-        if ($Policy -and $f['PolicyName'] -and $f['PolicyName'] -ne $Policy) { continue }
+        $eventPolicy = $f['PolicyGUID'] -as [guid]
+        if ($PolicyId -and $eventPolicy) {
+            if ($eventPolicy -ne $PolicyId) { continue }
+        } elseif ($haystack -notmatch $Match) { continue }
         [pscustomobject]@{
             Time     = $e.TimeCreated
             Event    = "$($e.Id) $($labels[$e.Id])"

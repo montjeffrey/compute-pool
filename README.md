@@ -292,9 +292,9 @@ Microsoft's Smart App Control template, so it keeps the same rules (Windows,
 reputable and publicly signed code) and adds your certificate, but Windows runs
 a program only if every enforced policy allows it. The documented path is to
 turn Smart App Control off and let the policy take its place. That is a
-Windows security setting, so it is your decision; since the April 2026 update
-(KB5083769) Smart App Control can be turned back on, and removing the policy
-and turning it back on restores the original state. (One Windows 11 desktop,
+Windows security setting, so it is your decision. Check whether your Windows
+version lets you turn Smart App Control back on later before you turn it
+off; older versions only allowed it after a reinstall. (One Windows 11 desktop,
 build 26300, also ran signed builds with the audit policy deployed and Smart
 App Control still on. Microsoft doesn't document that, so don't rely on it.)
 
@@ -310,23 +310,28 @@ App Control still on. Microsoft doesn't document that, so don't rely on it.)
    needs Windows Pro, Enterprise or Education; on Home, build it on another PC
    and copy the folder.
 3. **Sign** every build before you install it, from the signing account:
-   `pwsh scripts/appcontrol/sign.ps1 pool.exe -ExpectedSha256 <hash> -TimestampServer http://timestamp.digicert.com`.
-   The hash is the one from `SHA256SUMS` or your own build, so a file swapped
-   in between doesn't get your signature.
-4. **Audit**, from an elevated PowerShell:
-   `scripts/appcontrol/deploy-policy.ps1 out\compute-pool-audit.cip`. It blocks
-   nothing and logs what it would block. Run your signed `pool.exe`, and the
-   programs your jobs use.
+   `pwsh scripts/appcontrol/sign.ps1 pool.exe -Thumbprint <from step 1> -ExpectedSha256 <hash> -TimestampServer http://timestamp.digicert.com`.
+   The hash is the one from `SHA256SUMS` or your own build. The script signs a
+   private copy of the file, so the bytes it checked are the bytes it signs.
+4. **Audit**, from an elevated PowerShell 7, running copies of the scripts and
+   of `out\` that only administrators can change (an elevated script that
+   anyone else can edit is theirs to run):
+   `scripts\appcontrol\deploy-policy.ps1 out\compute-pool-policy.xml -Mode audit`.
+   It copies the XML into a folder only administrators can write, builds the
+   `.cip` from that copy and deploys it. The policy blocks nothing and logs
+   what it would block. Run your signed `pool.exe`, and the programs your jobs
+   use.
 5. **Check:** `pwsh scripts/appcontrol/check-audit.ps1 -Since '<time printed in step 4>'`
    lists App Control's decisions about matching files, with the signer Windows
    saw, and exits 1 if there are any. A signed `pool.exe` should have none; an
    unsigned one gets "would block (audit)".
-6. **Enforce:** `scripts/appcontrol/deploy-policy.ps1 out\compute-pool-enforce.cip -Program pool.exe`.
-   It refuses unless the same policy is active in audit mode, `-Program` is
-   signed by your certificate, and step 5 finds nothing since the audit policy
-   went in. No events can also mean the program never ran, so run it in step 4.
-   It prints the command that removes the policy:
-   `deploy-policy.ps1 -Remove out\compute-pool-policy.xml`.
+6. **Enforce:** `scripts\appcontrol\deploy-policy.ps1 out\compute-pool-policy.xml -Mode enforce -Program pool.exe`.
+   It refuses unless this script deployed the same policy in audit mode and
+   CiTool still lists it, `-Program` is signed by the very certificate the
+   policy trusts, and nothing since the audit deployment shows the policy
+   would block a program (any program, not only pool). No events can also
+   mean a program never ran, so run them in step 4. It prints the command
+   that removes the policy: `deploy-policy.ps1 out\compute-pool-policy.xml -Remove`.
 
 Programs that jobs ship (`--ship`, `poolbench`) are checked too, and unsigned
 ones are blocked; sign them, or ship scripts to an installed interpreter. The

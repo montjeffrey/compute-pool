@@ -4,11 +4,13 @@
 # trusted roots: only the App Control policy trusts it.
 #
 # The private key is made in the TPM when there is one, so it can't be
-# copied off this device. Without a TPM it falls back to a software key that
-# can't be exported (-RequireTpm refuses instead). Neither stops the key
-# being *used*: anything that runs as this account can sign code the policy
-# will trust. So create it under an account that runs nothing else, and
-# never under the account the agent runs as.
+# copied off this device. Without a TPM it falls back to a software key
+# marked non-exportable, which code running as this account can still
+# extract (-RequireTpm refuses instead). Neither stops the key being *used*:
+# anything that runs as this account can sign code the policy will trust.
+# So create it under an account that runs nothing else, and never under the
+# account the agent runs as. An existing certificate is reused only if it is
+# the only one with that subject and its key can't be exported.
 #
 #   pwsh scripts/appcontrol/new-cert.ps1 -Subject 'CN=Your Name' [-RequireTpm] [-OutFile pool-signing.cer]
 param(
@@ -18,8 +20,11 @@ param(
     [switch]$RequireTpm
 )
 $ErrorActionPreference = 'Stop'
-$cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Where-Object Subject -eq $Subject |
-    Sort-Object NotAfter -Descending | Select-Object -First 1
+$found = @(Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Where-Object Subject -eq $Subject)
+if ($found.Count -gt 1) {
+    throw "$($found.Count) certificates are named '$Subject' ($($found.Thumbprint -join ', ')); remove the ones you didn't make, or pick another -Subject"
+}
+$cert = $found[0]
 if ($cert) {
     "Reusing the existing certificate for '$Subject'."
 } else {
@@ -33,12 +38,16 @@ if ($cert) {
         $cert = New-SelfSignedCertificate @common -Provider 'Microsoft Platform Crypto Provider'
     } catch {
         if ($RequireTpm) { throw "no TPM-backed key could be created: $($_.Exception.Message)" }
-        Write-Warning "No TPM-backed key ($($_.Exception.Message)). Using a software key that can't be exported; it can still be used by anything running as this account."
+        Write-Warning "No TPM-backed key ($($_.Exception.Message)). Using a software key marked non-exportable; code running as this account can still use or extract it."
         $cert = New-SelfSignedCertificate @common -KeyExportPolicy NonExportable
     }
 }
 $key = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
 $provider = if ($key -is [Security.Cryptography.RSACng]) { $key.Key.Provider.Provider } else { $key.GetType().Name }
+$exportable = if ($key -is [Security.Cryptography.RSACng]) { $key.Key.ExportPolicy -ne [Security.Cryptography.CngExportPolicies]::None }
+    elseif ($key -is [Security.Cryptography.RSACryptoServiceProvider]) { $key.CspKeyContainerInfo.Exportable }
+    else { $true }
+if ($exportable) { throw "the key of the certificate for '$Subject' can be exported, so it may exist elsewhere; remove it and run this again" }
 if ($RequireTpm -and $provider -ne 'Microsoft Platform Crypto Provider') {
     throw "the certificate for '$Subject' uses '$provider', not the TPM; remove it or pick another -Subject"
 }

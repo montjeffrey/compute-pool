@@ -11,9 +11,12 @@
 #                              Operational, event 3076) and blocks nothing
 #   compute-pool-enforce.cip   the policy enforced
 # Both .cip files share one policy ID, so deploying the enforced one later
-# replaces the audit one. Deploy with deploy-policy.ps1.
+# replaces the audit one. Deploy with deploy-policy.ps1, which takes the XML
+# and builds its own .cip from a copy only administrators can change; the
+# .cip files here are for checking, or for a PC without ConfigCI.
 #
 #   pwsh scripts/appcontrol/build-policy.ps1 -CertificatePath pool-signing.cer -OutDir out
+#Requires -Version 7
 param(
     [Parameter(Mandatory)][string]$CertificatePath,
     [string]$OutDir = '.',
@@ -63,10 +66,14 @@ ConvertFrom-CIPolicy -XmlFilePath $xml -BinaryFilePath (Join-Path $OutDir 'compu
 Set-RuleOption -FilePath $xml -Option 3 # Enabled:Audit Mode
 ConvertFrom-CIPolicy -XmlFilePath $xml -BinaryFilePath (Join-Path $OutDir 'compute-pool-audit.cip') | Out-Null
 
+# The signer rule pins the SHA-256 of the certificate's to-be-signed part
+# (CertRoot Type="TBS"); deploy-policy.ps1 checks programs against it the
+# same way. Check that the rule pins exactly this certificate.
+$tbs = [Formats.Asn1.AsnReader]::new($cert.RawData, 'DER').ReadSequence().ReadEncodedValue().ToArray()
+$tbsHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($tbs))
 [xml]$p = Get-Content $xml
-$name = $cert.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
-$ours = @($p.SiPolicy.Signers.Signer | Where-Object Name -eq $name)
-if ($ours.Count -ne 1) { throw "expected one signer named '$name' in $xml, found $($ours.Count)" }
+$ours = @($p.SiPolicy.Signers.Signer | Where-Object { $_.CertRoot.Type -eq 'TBS' -and $_.CertRoot.Value -eq $tbsHash })
+if ($ours.Count -ne 1) { throw "expected one signer pinning $tbsHash in $xml, found $($ours.Count)" }
 "Policy ID: $($p.SiPolicy.PolicyID)"
 "Options:   " + (($p.SiPolicy.Rules.Rule | ForEach-Object Option) -join ', ')
 ""
