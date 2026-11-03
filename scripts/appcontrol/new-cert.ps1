@@ -1,23 +1,51 @@
 # Creates a self-signed code-signing certificate in your user certificate
 # store, for signing your own pool builds (sign.ps1) and trusting them in an
-# App Control policy (build-policy.ps1). The private key can't be exported,
-# so only this account on this device can sign with it. The certificate is
-# not added to trusted roots: only the App Control policy trusts it.
+# App Control policy (build-policy.ps1). The certificate is not added to
+# trusted roots: only the App Control policy trusts it.
 #
-#   pwsh scripts/appcontrol/new-cert.ps1 [-OutFile pool-signing.cer]
+# The private key is made in the TPM when there is one, so it can't be
+# copied off this device. Without a TPM it falls back to a software key that
+# can't be exported (-RequireTpm refuses instead). Neither stops the key
+# being *used*: anything that runs as this account can sign code the policy
+# will trust. So create it under an account that runs nothing else, and
+# never under the account the agent runs as.
+#
+#   pwsh scripts/appcontrol/new-cert.ps1 -Subject 'CN=Your Name' [-RequireTpm] [-OutFile pool-signing.cer]
 param(
     [string]$Subject = "CN=compute-pool code signing ($($env:COMPUTERNAME.ToLower()))",
-    [string]$OutFile = (Join-Path $env:LOCALAPPDATA 'compute-pool\signing\pool-signing.cer')
+    [string]$OutFile = (Join-Path $env:LOCALAPPDATA 'compute-pool\signing\pool-signing.cer'),
+    [int]$Years = 2,
+    [switch]$RequireTpm
 )
 $ErrorActionPreference = 'Stop'
 $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Where-Object Subject -eq $Subject |
     Sort-Object NotAfter -Descending | Select-Object -First 1
-if (-not $cert) {
-    # App Control signer rules need RSA (up to 4096 bits), not ECC.
-    $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $Subject -CertStoreLocation Cert:\CurrentUser\My `
-        -KeyAlgorithm RSA -KeyLength 3072 -HashAlgorithm SHA256 -KeyExportPolicy NonExportable -NotAfter (Get-Date).AddYears(10)
+if ($cert) {
+    "Reusing the existing certificate for '$Subject'."
+} else {
+    # App Control signer rules need RSA, not ECC. TPMs reliably support RSA
+    # 2048; many refuse 3072.
+    $common = @{
+        Type = 'CodeSigningCert'; Subject = $Subject; CertStoreLocation = 'Cert:\CurrentUser\My'
+        KeyAlgorithm = 'RSA'; KeyLength = 2048; HashAlgorithm = 'SHA256'; NotAfter = (Get-Date).AddYears($Years)
+    }
+    try {
+        $cert = New-SelfSignedCertificate @common -Provider 'Microsoft Platform Crypto Provider'
+    } catch {
+        if ($RequireTpm) { throw "no TPM-backed key could be created: $($_.Exception.Message)" }
+        Write-Warning "No TPM-backed key ($($_.Exception.Message)). Using a software key that can't be exported; it can still be used by anything running as this account."
+        $cert = New-SelfSignedCertificate @common -KeyExportPolicy NonExportable
+    }
+}
+$key = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+$provider = if ($key -is [Security.Cryptography.RSACng]) { $key.Key.Provider.Provider } else { $key.GetType().Name }
+if ($RequireTpm -and $provider -ne 'Microsoft Platform Crypto Provider') {
+    throw "the certificate for '$Subject' uses '$provider', not the TPM; remove it or pick another -Subject"
 }
 New-Item -ItemType Directory -Force (Split-Path $OutFile) | Out-Null
 Export-Certificate -Cert $cert -FilePath $OutFile | Out-Null
-"Certificate: $($cert.Subject) ($($cert.Thumbprint)), valid until $($cert.NotAfter.ToString('yyyy-MM-dd'))"
+"Certificate: $($cert.Subject)"
+"Thumbprint:  $($cert.Thumbprint)"
+"Key:         $provider"
+"Valid until: $($cert.NotAfter.ToString('yyyy-MM-dd'))"
 "Public part: $OutFile"
