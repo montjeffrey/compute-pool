@@ -1,0 +1,40 @@
+name: Bug report
+description: Something does not work as documented
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include secrets, API keys or private hostnames in this report. For security problems, do not use this form; see the security link on the issue chooser.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands or inputs, as small as you can make them.
+    validations:
+      required: true
+  - type: input
+    id: area
+    attributes:
+      label: Area
+      description: "Which command is affected (agent, nodes, run, map, dashboard)?"
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: "Output of `pool version` (or the commit) and the OS of each device involved, and your operating system."
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output or logs
+      description: Relevant output, with anything private removed.
+      render: shell
