@@ -151,9 +151,10 @@ to run them, and SmartScreen may warn.
   between.
 - **Job history is visible to allowed devices.** `/v1/jobs` and the dashboard
   show the first 200 characters of each job's command, and the agent logs
-  commands. Pass secrets with `--env`, which is never shown or logged, not as
-  arguments. Jobs running at the same time can still read each other's
-  environment.
+  commands. `/v1/log` serves that log (for `pool report`) to the same allowed
+  devices, which could read it anyway by running a command. Pass secrets with
+  `--env`, which is never shown or logged, not as arguments. Jobs running at
+  the same time can still read each other's environment.
 - **`--shell` with untrusted items is command injection by design.** In
   `pool map`, `{}` is substituted into the command as is.
 - **Retries and backup copies can run a task twice.** Use

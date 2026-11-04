@@ -19,39 +19,58 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/montjeffrey/compute-pool/internal/hwinfo"
 	"github.com/montjeffrey/compute-pool/internal/proto"
 	"github.com/montjeffrey/compute-pool/internal/sysinfo"
 )
 
 // Config configures an Agent.
 type Config struct {
-	NodeName string     // this device's short tailnet name
-	MaxJobs  int        // concurrent jobs; further requests get 503
-	WorkDir  string     // parent of each job's scratch directory
-	Auth     Authorizer // required
-	Logger   *log.Logger
+	NodeName string // this device's short tailnet name
+	// MaxJobs is the most jobs run at once. The live limit is lower while
+	// other programs use the CPU or memory is short; requests beyond it get
+	// 503 (see limit.go).
+	MaxJobs int
+	WorkDir string     // parent of each job's scratch directory
+	Auth    Authorizer // required
+	Logger  *log.Logger
 
-	// Probe reports current CPU load and power state. If nil, both are
-	// treated as unknown and never cause a refusal.
+	// Probe reports current CPU load, free memory and power state. If nil,
+	// all are treated as unknown and never cause a refusal.
 	Probe func() sysinfo.Snapshot
 	// LendOnBattery lets a laptop accept jobs while unplugged.
 	LendOnBattery bool
-	// BusyThreshold refuses new jobs while system CPU use is at or above
-	// this percentage, whether the load comes from the owner or from jobs
-	// already running. Zero disables the check.
+	// BusyThreshold refuses new jobs while CPU use by other programs (the
+	// owner's own work) is at or above this percentage. The agent's own jobs
+	// don't count when the Probe can tell them apart (Snapshot.OwnBusyPct);
+	// otherwise all CPU use does. Zero disables the check.
 	BusyThreshold float64
+	// JobMemoryMB is the memory each job is assumed to need until the agent
+	// has measured finished jobs (default DefaultJobMemoryMB).
+	JobMemoryMB int64
 
 	// CacheDir keeps shipped files by content hash between jobs; empty
 	// disables caching. CacheBytes caps its size (default 2 GiB).
 	CacheDir   string
 	CacheBytes int64
+
+	// Specs and Capacity, if set, are reported in Info so other devices can
+	// weigh this one (see pool setup).
+	Specs    *hwinfo.Specs
+	Capacity *proto.Capacity
+
+	// LogPath is the file the Logger writes to, if any. GET /v1/log serves it
+	// (with its rotated predecessor, LogPath+".1") so pool report can assess
+	// this device from another one.
+	LogPath string
 }
 
 // Agent serves the pool HTTP API.
 type Agent struct {
 	cfg     Config
 	cache   *fileCache // nil when caching is off
-	slots   chan struct{}
+	cpus    int
+	mem     memEstimate
 	running atomic.Int32
 	seq     atomic.Uint64
 	started time.Time
@@ -59,6 +78,11 @@ type Agent struct {
 	histMu  sync.Mutex
 	active  map[string]*proto.JobRecord
 	history []proto.JobRecord // finished jobs, oldest first, at most historySize
+
+	admitMu   sync.Mutex
+	admitted  map[uint64]time.Time // job slots taken, with when
+	ticket    uint64
+	lastLimit int // for logging changes
 
 	hostsMu      sync.RWMutex
 	allowedHosts map[string]bool // empty: any Host header
@@ -118,6 +142,51 @@ func (a *Agent) handleJobs(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(a.Jobs())
 }
 
+// ReadLog reads a rotating log, path.1 then path, older lines first. Both
+// are read whole before returning, so they are held open only briefly (on
+// Windows an open file can't be renamed, which postpones rotation). If the
+// log rotated between the two reads, the read is retried, since the middle
+// would be missing. It returns os.ErrNotExist if neither file exists.
+func ReadLog(path string) ([]byte, error) {
+	for attempt := 0; ; attempt++ {
+		before, statErr := os.Stat(path)
+		old, err := os.ReadFile(path + ".1")
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		cur, err := os.ReadFile(path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		if old == nil && cur == nil {
+			return nil, fmt.Errorf("%s: %w", path, os.ErrNotExist)
+		}
+		// A rotation since the Stat leaves the current file smaller.
+		if statErr == nil && int64(len(cur)) < before.Size() && attempt < 2 {
+			continue
+		}
+		return append(old, cur...), nil
+	}
+}
+
+// handleLog sends the agent's log, older lines first. Devices allowed to
+// call it can already run commands here, so it reveals nothing new to them.
+func (a *Agent) handleLog(w http.ResponseWriter, r *http.Request) {
+	if a.cfg.LogPath == "" {
+		http.Error(w, "this agent's log is not kept in a file (start it with --log-file)", http.StatusNotFound)
+		return
+	}
+	body, err := ReadLog(a.cfg.LogPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		a.cfg.Logger.Printf("read log for %s: %v", r.RemoteAddr, err)
+		http.Error(w, "can't read the log", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_, _ = w.Write(body)
+}
+
 // New validates cfg and prepares the work directory.
 func New(cfg Config) (*Agent, error) {
 	if cfg.Auth == nil {
@@ -142,11 +211,17 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = log.New(os.Stderr, "", log.LstdFlags)
 	}
+	if cfg.JobMemoryMB <= 0 {
+		cfg.JobMemoryMB = DefaultJobMemoryMB
+	}
 	a := &Agent{
-		cfg:     cfg,
-		slots:   make(chan struct{}, cfg.MaxJobs),
-		started: time.Now(),
-		active:  make(map[string]*proto.JobRecord),
+		cfg:       cfg,
+		cpus:      runtime.NumCPU(),
+		mem:       memEstimate{def: cfg.JobMemoryMB},
+		started:   time.Now(),
+		active:    make(map[string]*proto.JobRecord),
+		admitted:  make(map[uint64]time.Time),
+		lastLimit: -1,
 	}
 	if cfg.CacheDir != "" {
 		if cfg.CacheBytes <= 0 {
@@ -193,6 +268,7 @@ func (a *Agent) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/info", a.handleInfo)
 	mux.HandleFunc("POST /v1/run", a.handleRun)
 	mux.HandleFunc("GET /v1/jobs", a.handleJobs)
+	mux.HandleFunc("GET /v1/log", a.handleLog)
 	return a.authenticate(mux)
 }
 
@@ -237,14 +313,25 @@ func (a *Agent) authenticate(next http.Handler) http.Handler {
 			return
 		}
 		if !a.hostAllowed(r.Host) || fromBrowser(r) {
-			a.cfg.Logger.Printf("refused %s %s from %s: browser-originated request or unexpected Host %q", r.Method, r.URL.Path, host, r.Host)
+			a.cfg.Logger.Printf("refused %s %q from %s: browser-originated request or unexpected Host %q", r.Method, r.URL.Path, host, r.Host)
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
 		id, err := a.cfg.Auth.Authorize(r.Context(), host)
 		if err != nil {
 			// Details stay in the local log; the caller only learns it was refused.
-			a.cfg.Logger.Printf("refused %s %s from %s: %v", r.Method, r.URL.Path, host, err)
+			// %q: the path is the caller's, and a decoded newline in it would
+			// otherwise start a forged log line.
+			a.cfg.Logger.Printf("refused %s %q from %s: %v", r.Method, r.URL.Path, host, err)
+			if !errors.Is(err, ErrForbidden) {
+				// The caller couldn't be identified yet (tailscale whois failed
+				// or is slow on a busy device): still refused, but as busy, so
+				// an allowed device retries or moves on instead of being told
+				// it isn't allowed. The lookup carries on and fills the cache.
+				w.Header().Set("Retry-After", "2")
+				http.Error(w, "can't confirm who is asking yet; try again shortly", http.StatusServiceUnavailable)
+				return
+			}
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -254,20 +341,22 @@ func (a *Agent) authenticate(next http.Handler) http.Handler {
 
 func (a *Agent) snapshot() sysinfo.Snapshot {
 	if a.cfg.Probe == nil {
-		return sysinfo.Snapshot{CPUBusyPct: -1, Power: sysinfo.Power{BatteryPct: -1}}
+		return sysinfo.Snapshot{CPUBusyPct: -1, OwnBusyPct: -1, Power: sysinfo.Power{BatteryPct: -1}}
 	}
 	return a.cfg.Probe()
 }
 
-// refusal returns why a new job would be refused right now, or "" if it
-// would be accepted. Slot availability is checked separately, atomically,
-// when a job actually arrives.
+// refusal returns why the agent takes no jobs at all right now, or "". The
+// live job limit is checked separately, atomically, when a job arrives.
 func (a *Agent) refusal(s sysinfo.Snapshot) string {
 	if s.Power.OnBattery && !a.cfg.LendOnBattery {
 		return "on battery"
 	}
-	if a.cfg.BusyThreshold > 0 && s.CPUBusyPct >= a.cfg.BusyThreshold {
-		return fmt.Sprintf("cpu busy (%.0f%%)", s.CPUBusyPct)
+	// Only other programs count: the agent's own jobs are expected to use
+	// the CPU, and counting them would make it refuse work whenever it lends
+	// most of the device, then accept again as jobs drain, over and over.
+	if other := s.OtherBusyPct(); a.cfg.BusyThreshold > 0 && other >= a.cfg.BusyThreshold {
+		return fmt.Sprintf("cpu busy (%.0f%%)", other)
 	}
 	return ""
 }
@@ -293,10 +382,18 @@ func (a *Agent) info() proto.Info {
 		HasBattery:  s.Power.HasBattery,
 		OnBattery:   s.Power.OnBattery,
 		BatteryPct:  s.Power.BatteryPct,
+		Specs:       a.cfg.Specs,
+		Capacity:    a.cfg.Capacity,
+	}
+	st := a.slots(s)
+	info.JobLimit, info.LimitReason = st.limit, st.why
+	info.JobMemoryMB, info.JobMemoryMeasured = st.jobMemMB, st.measured
+	if s.Memory.Known {
+		info.FreeMemoryMB = s.Memory.FreeMB
 	}
 	info.Reason = a.refusal(s)
-	if info.Reason == "" && info.Running >= info.MaxJobs {
-		info.Reason = fmt.Sprintf("all %d job slots in use", info.MaxJobs)
+	if info.Reason == "" && st.admitted >= st.limit {
+		info.Reason = fullReason(st.limit, st.why)
 	}
 	info.Accepting = info.Reason == ""
 	return info
@@ -319,17 +416,17 @@ func (a *Agent) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 	// Refuse before reading the body, so busy agents don't buffer uploads
 	// they will reject, and at most MaxJobs bodies are in memory at once.
-	if reason := a.refusal(a.snapshot()); reason != "" {
+	s := a.snapshot()
+	if reason := a.refusal(s); reason != "" {
 		http.Error(w, reason, http.StatusServiceUnavailable)
 		return
 	}
-	select {
-	case a.slots <- struct{}{}:
-		defer func() { <-a.slots }()
-	default:
-		http.Error(w, fmt.Sprintf("all %d job slots in use", a.cfg.MaxJobs), http.StatusServiceUnavailable)
+	release, reason := a.admit(s)
+	if release == nil {
+		http.Error(w, reason, http.StatusServiceUnavailable)
 		return
 	}
+	defer release()
 
 	var req proto.RunRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, proto.MaxRequestBytes)).Decode(&req); err != nil {

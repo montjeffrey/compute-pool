@@ -198,6 +198,45 @@ func TestRotatingLogRotatesWhileRunning(t *testing.T) {
 	}
 }
 
+// A reader holding the log open (pool report) makes the rename fail on
+// Windows. Rotation must then wait, not empty the file in place.
+func TestRotatingLogKeepsLinesWhileRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.log")
+	l, err := newRotatingLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	line := append(bytes.Repeat([]byte("x"), 1<<20-1), '\n')
+	for i := 0; i < 9; i++ {
+		if _, err := l.Write(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reader, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ { // past the limit while the reader is open
+		if _, err := l.Write(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reader.Close()
+	if _, err := l.Write([]byte("last\n")); err != nil {
+		t.Fatal(err)
+	}
+	var total int64
+	for _, p := range []string{path, path + ".1"} {
+		if info, err := os.Stat(p); err == nil {
+			total += info.Size()
+		}
+	}
+	if want := int64(12*len(line) + len("last\n")); total != want {
+		t.Errorf("log and rotated log hold %d bytes, want %d: lines were lost", total, want)
+	}
+}
+
 func TestAgentHosts(t *testing.T) {
 	got := agentHosts("100.64.0.1:7470", tsutil.Peer{IPv4: "100.64.0.1", DNSName: "desktop.example.ts.net", Name: "desktop"})
 	want := []string{"100.64.0.1:7470", "100.64.0.1:7470", "desktop.example.ts.net:7470", "desktop:7470"}

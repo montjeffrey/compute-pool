@@ -36,15 +36,28 @@ type TailnetAuthorizer struct {
 	allow  map[string]bool
 	lookup func(ctx context.Context, ip string) (tsutil.WhoIs, error)
 	ttl    time.Duration
+	now    func() time.Time
 
-	mu    sync.Mutex
-	cache map[string]cachedWhoIs
+	mu       sync.Mutex
+	cache    map[string]cachedWhoIs // successful lookups only
+	inflight map[string]*whoisCall
 }
 
 type cachedWhoIs struct {
 	who     tsutil.WhoIs
 	expires time.Time
 }
+
+// whoisCall is one tailscale whois run, shared by every request from that
+// address while it runs. done is closed once who and err are set.
+type whoisCall struct {
+	done chan struct{}
+	who  tsutil.WhoIs
+	err  error
+}
+
+// whoisTimeout bounds one tailscale whois run.
+const whoisTimeout = 5 * time.Second
 
 // NewTailnetAuthorizer admits nodes named in allow (short names, any case)
 // that belong to owner.
@@ -56,11 +69,13 @@ func NewTailnetAuthorizer(owner string, allow []string) *TailnetAuthorizer {
 		}
 	}
 	return &TailnetAuthorizer{
-		owner:  owner,
-		allow:  set,
-		lookup: tsutil.LookupWhoIs,
-		ttl:    time.Minute,
-		cache:  make(map[string]cachedWhoIs),
+		owner:    owner,
+		allow:    set,
+		lookup:   tsutil.LookupWhoIs,
+		ttl:      time.Minute,
+		now:      time.Now,
+		cache:    make(map[string]cachedWhoIs),
+		inflight: make(map[string]*whoisCall),
 	}
 }
 
@@ -123,8 +138,6 @@ func (a *TailnetAuthorizer) Authorize(ctx context.Context, remoteIP string) (Ide
 	if !inTailnetRange(remoteIP) {
 		return Identity{}, fmt.Errorf("%w: %s is not a Tailscale address", ErrForbidden, remoteIP)
 	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
 	who, err := a.whois(ctx, remoteIP)
 	if err != nil {
 		return Identity{}, fmt.Errorf("identify %s: %w", remoteIP, err)
@@ -139,20 +152,55 @@ func (a *TailnetAuthorizer) Authorize(ctx context.Context, remoteIP string) (Ide
 	return id, nil
 }
 
+// whois returns who is at ip, from the cache while a successful lookup is
+// less than ttl old. Only successes are cached, so a device removed from the
+// tailnet or the allow list loses access within ttl.
+//
+// The lookup runs apart from the request: on a busy device tailscale whois
+// can take longer than a status probe waits (a second), and killing it when
+// the caller gave up meant the cache never filled, so every probe from an
+// allowed device was refused. Now the lookup finishes and the next request
+// is served from the cache. An entry in the last quarter of its life is
+// refreshed in the background, so a device that keeps polling never waits.
 func (a *TailnetAuthorizer) whois(ctx context.Context, ip string) (tsutil.WhoIs, error) {
-	now := time.Now()
+	now := a.now()
 	a.mu.Lock()
-	c, ok := a.cache[ip]
+	c, cached := a.cache[ip]
+	cached = cached && now.Before(c.expires)
+	call := a.inflight[ip]
+	if call == nil && (!cached || c.expires.Sub(now) < a.ttl/4) {
+		call = &whoisCall{done: make(chan struct{})}
+		a.inflight[ip] = call
+		go a.runWhois(ctx, ip, call, now)
+	}
 	a.mu.Unlock()
-	if ok && now.Before(c.expires) {
+	if cached {
 		return c.who, nil
 	}
-	who, err := a.lookup(ctx, ip)
-	if err != nil {
-		return tsutil.WhoIs{}, err
+	select {
+	case <-call.done:
+		return call.who, call.err
+	case <-ctx.Done():
+		return tsutil.WhoIs{}, ctx.Err()
 	}
+}
+
+// runWhois runs one lookup started at start and caches it if it succeeded.
+func (a *TailnetAuthorizer) runWhois(ctx context.Context, ip string, call *whoisCall, start time.Time) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), whoisTimeout)
+	defer cancel()
+	call.who, call.err = a.lookup(ctx, ip)
 	a.mu.Lock()
-	a.cache[ip] = cachedWhoIs{who: who, expires: now.Add(a.ttl)}
+	delete(a.inflight, ip)
+	if call.err == nil {
+		// Expiry counts from the start, never extending what a lookup vouches for.
+		a.cache[ip] = cachedWhoIs{who: call.who, expires: start.Add(a.ttl)}
+		for k, e := range a.cache {
+			if !start.Before(e.expires) {
+				delete(a.cache, k)
+			}
+		}
+	}
 	a.mu.Unlock()
-	return who, nil
+	close(call.done)
 }

@@ -25,6 +25,15 @@ type installPaths struct {
 	base, bin, exe, log string
 }
 
+// installedAgentLog is where the installed agent logs, or "" if unknown.
+func installedAgentLog() string {
+	p, err := defaultInstallPaths()
+	if err != nil {
+		return ""
+	}
+	return p.log
+}
+
 func defaultInstallPaths() (installPaths, error) {
 	local := os.Getenv("LOCALAPPDATA")
 	if local == "" {

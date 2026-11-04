@@ -101,6 +101,41 @@ func (c *Client) Jobs(ctx context.Context, host string) (proto.Jobs, error) {
 	return jobs, nil
 }
 
+// ErrNoLog means the agent doesn't serve its log: it is older than this
+// client, or it logs to the console instead of a file.
+var ErrNoLog = errors.New("agent doesn't share its log")
+
+// maxLogBytes bounds a fetched log: an agent keeps two files of 10 MB.
+const maxLogBytes = 64 << 20
+
+// Log fetches an agent's log, older lines first.
+func (c *Client) Log(ctx context.Context, host string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(host, "/v1/log"), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("%w: %s", ErrNoLog, strings.TrimSpace(string(msg)))
+	}
+	if err := checkStatus(resp); err != nil {
+		return nil, err
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxLogBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read log: %w", err)
+	}
+	if len(b) > maxLogBytes {
+		return nil, fmt.Errorf("log is larger than %d MB", maxLogBytes>>20)
+	}
+	return b, nil
+}
+
 // New returns a Client with timeouts suited to long-running streamed jobs:
 // connecting and receiving response headers are bounded, the body is not.
 func New() *Client {
