@@ -80,6 +80,26 @@ jobs:
       - name: gitleaks
         run: go run github.com/zricethezav/gitleaks/v8@v8.30.1 git --redact --no-banner .
 
+  # The App Control scripts, with the Pester 5 that GitHub's Windows images
+  # ship (nothing is installed). The tests never deploy a policy: they run
+  # deploy-policy.ps1 against a fake CiTool.
+  appcontrol:
+    name: appcontrol scripts
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pester
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.5 -MaximumVersion 5.99
+          $c = New-PesterConfiguration
+          $c.Run.Path = 'scripts/appcontrol'
+          $c.Run.Exit = $true
+          $c.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $c
+
   # Static analysis of these workflow files: unpinned actions, template
   # injection, leaked credentials, overly broad permissions and the like.
   # pipx (preinstalled on GitHub's Ubuntu runners) runs a pinned release.
