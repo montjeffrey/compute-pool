@@ -208,18 +208,21 @@ func sysfsCores(sysRoot string) (physical, perf, eff int) {
 // sysctlSpecs builds Specs from macOS sysctl values; get returns "" for a
 // name the system doesn't have.
 func sysctlSpecs(get func(name string) string) Specs {
-	num := func(name string) int64 {
-		n, _ := strconv.ParseInt(get(name), 10, 64)
+	// Counts parse straight to int, so a huge value can't wrap in a
+	// conversion; memory needs 64 bits.
+	count := func(name string) int {
+		n, _ := strconv.Atoi(get(name))
 		return n
 	}
+	bytes, _ := strconv.ParseInt(get("hw.memsize"), 10, 64)
 	s := Specs{
 		CPUModel:      get("machdep.cpu.brand_string"),
-		PhysicalCores: int(num("hw.physicalcpu")),
-		MemoryMB:      num("hw.memsize") / (1 << 20),
+		PhysicalCores: count("hw.physicalcpu"),
+		MemoryMB:      bytes / (1 << 20),
 	}
 	// Apple silicon numbers its core types from fastest (perflevel0) down.
-	if num("hw.nperflevels") >= 2 {
-		p, e := int(num("hw.perflevel0.physicalcpu")), int(num("hw.perflevel1.physicalcpu"))
+	if count("hw.nperflevels") >= 2 {
+		p, e := count("hw.perflevel0.physicalcpu"), count("hw.perflevel1.physicalcpu")
 		if p > 0 && e > 0 && p+e == s.PhysicalCores {
 			s.PerfCores, s.EffCores = p, e
 		}
