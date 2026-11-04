@@ -1,10 +1,23 @@
 version: 2
 updates:
+  # Updates wait a week after release (cooldown), so a compromised version is
+  # more likely to be caught and pulled before it reaches this repository.
+  # Minor and patch updates arrive as one grouped PR per ecosystem.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        update-types: [minor, patch]
   - package-ecosystem: gomod
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      go:
+        update-types: [minor, patch]
