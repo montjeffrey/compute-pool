@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -75,6 +76,18 @@ func TestHelperProcess(t *testing.T) {
 			b[i] = 1
 		}
 		runtime.KeepAlive(b)
+	case "grow":
+		// Allocate 4 MB at a time up to 1 GB, touching each page, so a
+		// memory limit is reached gradually rather than by one huge request.
+		var keep [][]byte
+		for i := 0; i < 256; i++ {
+			b := make([]byte, 4<<20)
+			for j := 0; j < len(b); j += 4096 {
+				b[j] = 1
+			}
+			keep = append(keep, b)
+		}
+		runtime.KeepAlive(keep)
 	case "sleep":
 		time.Sleep(time.Minute)
 	case "spawn":
@@ -86,6 +99,19 @@ func TestHelperProcess(t *testing.T) {
 		}
 		fmt.Println("spawned")
 		time.Sleep(time.Minute)
+	case "leave":
+		// Start a grandchild and exit at once, leaving it behind.
+		child := exec.Command(os.Args[0], "-test.run=TestHelperProcess", "--", "heartbeat")
+		child.Env = os.Environ()
+		if err := child.Start(); err != nil {
+			os.Exit(1)
+		}
+		for i := 0; i < 200; i++ { // until it has written once
+			if _, err := os.Stat(os.Getenv("HEARTBEAT_FILE")); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	case "heartbeat":
 		deadline := time.Now().Add(30 * time.Second) // never outlive a broken test for long
 		for i := 0; time.Now().Before(deadline); i++ {
@@ -294,6 +320,23 @@ func TestCancelKillsWholeProcessTree(t *testing.T) {
 	after, _ := os.ReadFile(beat)
 	if !bytes.Equal(before, after) {
 		t.Errorf("grandchild still running after cancel (heartbeat %s -> %s)", before, after)
+	}
+}
+
+func TestFinishedJobLeavesNothingRunning(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	beat := filepath.Join(t.TempDir(), "heartbeat")
+	res, _, stderr, err := h.run(t, context.Background(), helperRequest(t, "leave", map[string]string{"HEARTBEAT_FILE": beat}))
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("res=%+v err=%v stderr=%s", res, err, stderr)
+	}
+	// If the grandchild survived the job, it keeps rewriting the file.
+	time.Sleep(300 * time.Millisecond)
+	before, _ := os.ReadFile(beat)
+	time.Sleep(500 * time.Millisecond)
+	after, _ := os.ReadFile(beat)
+	if len(before) == 0 || !bytes.Equal(before, after) {
+		t.Errorf("grandchild still running after the job finished (heartbeat %q -> %q)", before, after)
 	}
 }
 
@@ -870,6 +913,83 @@ func TestJobMemoryIsMeasured(t *testing.T) {
 	// The job used 200 MB on top of the test binary itself.
 	if !info.JobMemoryMeasured || info.JobMemoryMB < 200 || info.JobMemoryMB > 1024 {
 		t.Errorf("job memory = %d MB (measured %v), want 200-1024", info.JobMemoryMB, info.JobMemoryMeasured)
+	}
+}
+
+func TestJobMemoryLimit(t *testing.T) {
+	if !agent.JobMemoryLimitEnforced {
+		t.Skip("job memory limit not enforced on " + runtime.GOOS)
+	}
+	h := newHarnessWith(t, 1, allowAll{}, func(c *agent.Config) { c.JobMemoryLimitMB = 128 })
+	res, _, _, err := h.run(t, context.Background(), helperRequest(t, "grow", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 137 || !strings.Contains(res.RemoteError, "memory limit of 128 MB") {
+		t.Errorf("job growing past its limit: exit=%d remote error=%q, want 137 and the limit", res.ExitCode, res.RemoteError)
+	}
+	// The same job runs to the end without a limit.
+	h = newHarness(t, 1, allowAll{})
+	if res, _, stderr, err := h.run(t, context.Background(), helperRequest(t, "grow", nil)); err != nil || res.ExitCode != 0 {
+		t.Errorf("without a limit: res=%+v err=%v stderr=%s", res, err, stderr)
+	}
+}
+
+// lockedProbe is a fixedProbe that is safe to change while the agent reads it.
+type lockedProbe struct {
+	mu   sync.Mutex
+	snap sysinfo.Snapshot
+}
+
+func (p *lockedProbe) get() sysinfo.Snapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.snap
+}
+
+func (p *lockedProbe) setFreeMB(mb int64) {
+	p.mu.Lock()
+	p.snap.Memory.FreeMB = mb
+	p.mu.Unlock()
+}
+
+func TestLowMemoryGuardEndsJob(t *testing.T) {
+	probe := &lockedProbe{snap: sysinfo.Snapshot{CPUBusyPct: -1, OwnBusyPct: -1, Power: sysinfo.Power{BatteryPct: -1},
+		Memory: sysinfo.Memory{Known: true, TotalMB: 16384, FreeMB: 8000}}}
+	h := newHarnessWith(t, 1, allowAll{}, func(c *agent.Config) { c.Probe = probe.get })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.agent.GuardMemory(ctx, 10*time.Millisecond)
+
+	type outcome struct {
+		res client.Result
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, _, _, err := h.run(t, context.Background(), helperRequest(t, "sleep", nil))
+		done <- outcome{res, err}
+	}()
+	waitFor(t, "sleep job to start", func() bool { return h.agent.Running() == 1 })
+	time.Sleep(50 * time.Millisecond)
+	if h.agent.Running() != 1 {
+		t.Fatal("guard stopped a job with plenty of memory free")
+	}
+
+	probe.setFreeMB(300) // the owner opened something big
+	select {
+	case o := <-done:
+		if o.err != nil {
+			t.Fatal(o.err)
+		}
+		if o.res.ExitCode != 137 || !strings.Contains(o.res.RemoteError, "ran low on memory") {
+			t.Errorf("stopped job: exit=%d remote error=%q, want 137 and a low-memory reason", o.res.ExitCode, o.res.RemoteError)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("guard did not stop the job")
+	}
+	if recent := h.agent.Jobs().Recent; len(recent) != 1 || recent[0].ExitCode != 137 {
+		t.Errorf("history = %+v", recent)
 	}
 }
 

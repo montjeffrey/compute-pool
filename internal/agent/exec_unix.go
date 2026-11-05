@@ -39,10 +39,18 @@ func lowerPriority(cmd *exec.Cmd) {
 	_ = syscall.Setpriority(syscall.PRIO_PGRP, cmd.Process.Pid, 10)
 }
 
+// JobMemoryLimitEnforced reports whether Config.JobMemoryLimitMB takes
+// effect on this platform. It doesn't here: an address-space rlimit would
+// break programs that reserve far more than they use (Go, Java, browsers),
+// and cgroups need setup the agent can't assume. The low-memory guard still
+// applies.
+const JobMemoryLimitEnforced = false
+
 // trackMemory returns a function that reports the job's peak memory in bytes
 // (0 if unknown) once it has exited: the largest resident size among the
-// job's process and the descendants it waited for.
-func trackMemory(cmd *exec.Cmd) func() uint64 {
+// job's process and the descendants it waited for. The memory limit is not
+// enforced (see JobMemoryLimitEnforced), so onLimit is never called.
+func trackMemory(cmd *exec.Cmd, _ int64, _ func()) func() uint64 {
 	return func() uint64 {
 		if cmd.ProcessState == nil {
 			return 0

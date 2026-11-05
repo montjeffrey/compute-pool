@@ -104,8 +104,11 @@ Stop-PoolAgents
 //
 // Task Scheduler's restart-on-failure only covers a task that fails to
 // launch, not a program that later exits or is killed, so a trigger that
-// fires every minute acts as the watchdog: with MultipleInstances IgnoreNew
-// it does nothing while the agent runs and relaunches it if it has died.
+// fires every five minutes acts as the watchdog: with MultipleInstances
+// IgnoreNew it does nothing while the agent runs and relaunches it if it has
+// died. Both are kept slow and short: when App Control or Smart App Control
+// blocks pool.exe, every attempt fails the same way and adds entries to the
+// Code Integrity log, so retrying each minute forever only fills that log.
 // That same watchdog can relaunch the old agent, with its old arguments,
 // while the executable is replaced; IgnoreNew would then ignore the final
 // Start-ScheduledTask. So the agent is stopped again after registering, and
@@ -115,8 +118,8 @@ $ErrorActionPreference = 'Stop'
 # USERDOMAIN reads "WORKGROUP" in SSH sessions; the token's name is reliable.
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $action = New-ScheduledTaskAction -Execute $env:POOL_EXE -Argument $env:POOL_ARGS -WorkingDirectory $env:POOL_DIR
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -DontStopOnIdleEnd -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
-$watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -DontStopOnIdleEnd -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
+$watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5)
 $mode = 'at startup'
 try {
   $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited
@@ -249,7 +252,7 @@ func cmdInstall(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	if state == "unverified" {
 		fmt.Fprintf(stdout, "The agent is running, but its flags can't be read from this shell; an elevated one can check them.\n")
 	}
-	fmt.Fprintf(stdout, "It restarts within a minute if it stops. Remove it with: pool uninstall\n")
+	fmt.Fprintf(stdout, "It restarts within five minutes if it stops. Remove it with: pool uninstall\n")
 	return nil
 }
 

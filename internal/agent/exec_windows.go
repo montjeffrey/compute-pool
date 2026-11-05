@@ -56,14 +56,23 @@ func killTree(cmd *exec.Cmd) error {
 }
 
 // reapTree is a no-op on Windows: once the main process has exited its
-// children can no longer be found by parent, and the agent-wide job object
-// still ends them when the agent exits.
+// children can no longer be found by parent. The job's own job object ends
+// them instead when trackMemory's function releases it, and the agent-wide
+// job object ends any that escaped tracking when the agent exits.
 func reapTree(*exec.Cmd) {}
 
 // lowerPriority is a no-op on Windows; CreationFlags already set the class.
 func lowerPriority(*exec.Cmd) {}
 
-// trackMemory starts measuring the job's memory. The returned function
-// reports the peak in bytes (0 if unknown) once the job has exited. A child
-// the job starts in the instant before tracking begins isn't counted.
-func trackMemory(cmd *exec.Cmd) func() uint64 { return sysinfo.TrackMemory(cmd.Process.Pid) }
+// JobMemoryLimitEnforced reports whether Config.JobMemoryLimitMB takes
+// effect on this platform.
+const JobMemoryLimitEnforced = true
+
+// trackMemory starts measuring the job's memory and, if limitMB is above
+// zero, caps what the job and its children can commit together, calling
+// onLimit once if they try to go past it. The returned function reports the
+// peak in bytes (0 if unknown) once the job has exited. A child the job
+// starts in the instant before tracking begins isn't counted or capped.
+func trackMemory(cmd *exec.Cmd, limitMB int64, onLimit func()) func() uint64 {
+	return sysinfo.TrackMemory(cmd.Process.Pid, uint64(max(0, limitMB))<<20, onLimit)
+}

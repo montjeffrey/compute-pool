@@ -180,7 +180,21 @@ laptop                 windows/amd64  16    13.4  16%   0/2   battery 65%  pause
 
 Owner activity is judged from total CPU load, not keyboard or mouse input:
 an agent started over SSH or as a service can't see the desktop session's input.
-Jobs already running are not paused; they keep below-normal priority.
+Jobs already running aren't paused when the CPU gets busy; they keep
+below-normal priority.
+
+Memory is guarded harder than CPU, because a device that runs out of it
+starts paging and can stop responding altogether:
+
+- **Each job has a memory limit** (`--job-memory-limit`, default a third of
+  the device's memory, at least 1 GB): the job and everything it starts can't
+  commit more. A job that reaches it is stopped with exit code 137 and says
+  so. Enforced on Windows; Linux and macOS don't enforce it yet.
+- **Running jobs are stopped when free memory gets critically low**: below
+  half the reserve kept for you (the larger of 512 MB and a twentieth of
+  RAM), the agent stops its newest job, waits ten seconds for the memory to
+  come back, and repeats while it stays low. These jobs also end with exit
+  code 137 and give the reason.
 
 ## How it stays safe
 
@@ -204,7 +218,9 @@ layers:
   so a device shared into your tailnet can't pose as an idle agent to receive them.
 - Traffic is encrypted by Tailscale's WireGuard tunnel.
 - Jobs run at **below-normal priority** in a fresh scratch folder (deleted
-  afterwards). Canceling (Ctrl+C) or `--timeout` kills the **whole process tree**.
+  afterwards), with a **memory limit** and a low-memory guard (see
+  [How placement works](#how-placement-works)). Canceling (Ctrl+C) or
+  `--timeout` kills the **whole process tree**.
 
 [SECURITY.md](SECURITY.md) has the full threat model, the known limits, and how
 to report a vulnerability.
@@ -308,7 +324,7 @@ never as SYSTEM, and stores no password:
 
 - From an elevated shell it runs **at startup**, before anyone logs in, with no window.
   Otherwise it runs **at logon** (a console window flashes once and hides).
-- A watchdog trigger relaunches the agent within a minute if it dies.
+- A watchdog trigger relaunches the agent within five minutes if it dies.
   Task Scheduler's own restart-on-failure only covers launch failures.
 - It keeps running on battery; the agent's own policy decides whether to lend CPU.
 - The log is `%LOCALAPPDATA%\compute-pool\agent.log` (rotated at 10 MB).
@@ -402,7 +418,7 @@ the agents use.
 | Command | Flags |
 |---|---|
 | `pool setup` | Measures this device, recommends agent settings and, once you confirm, installs the agent with them (on Linux and macOS it prints the `pool agent` command instead). `--json` print the recommendation and change nothing · `--yes` apply without asking · `--no-measure` use the saved measurement or the specs · `--measure-time 2s` · `--allow a,b` · `--keep N` threads to keep free for you · `--job-memory 512` MB per job |
-| `pool agent` | `--allow a,b` devices that may submit jobs (this device is always allowed) · `--max-jobs N` (default: half the logical CPUs) · `--lend-on-battery` · `--busy-threshold 80` (0 = never pause) · `--cache-mb 2048` · `--job-memory 512` MB to assume each job needs until jobs have been measured · `--port 7470` · `--work-dir` · `--listen` · `--log-file FILE` log to a file instead of stderr · `--hide-console` detach from the console window (the startup task uses it) |
+| `pool agent` | `--allow a,b` devices that may submit jobs (this device is always allowed) · `--max-jobs N` (default: half the logical CPUs) · `--lend-on-battery` · `--busy-threshold 80` (0 = never pause) · `--job-memory-limit MB` (default a third of RAM; 0 = none; Windows) · `--cache-mb 2048` · `--job-memory 512` MB to assume each job needs until jobs have been measured · `--port 7470` · `--work-dir` · `--listen` · `--log-file FILE` log to a file instead of stderr · `--hide-console` detach from the console window (the startup task uses it) |
 | `pool run [--node N] -- cmd args...` | `--node auto` (default) or a device name/IP · `--shell` run via cmd.exe or /bin/sh · `--ship` · `--collect` · `--out pool-out` · `--timeout D` (0 = no limit) · `--env K=V` (repeatable) · `-v` shows where the job went · `--probe-timeout 1s` · `--port 7470` |
 | `pool map (--range A..B \| --items F \| --inputs GLOB) -- cmd {}` | `--ship` · `--collect` · `--out pool-out` · `--nodes a,b` · `--jobs N` · `--retries 2` · `--speculate` · `--keep-order` · `--shell` · `--timeout` · `--env K=V` · `-v` · `--dry-run` predict how the tasks would spread over the devices and run nothing · `--task-time D` with `--dry-run`, how long one task takes alone on this device · `--probe-timeout 1s` · `--port 7470` |
 | `pool nodes` | `--timeout 1s` · `--port 7470` |
