@@ -37,8 +37,11 @@ your `PATH`. Release binaries are built by GitHub Actions from the tagged
 commit. They aren't code-signed yet, so Windows may warn before running them, and
 on a PC with Smart App Control turned on it may refuse to run them at all.
 Smart App Control judges each file separately, so one release can run while the
-next is blocked. [Application control](#application-control-windows) covers
-signing your own builds and trusting them with an App Control policy.
+next is blocked. Signing through SignPath Foundation is being set up (see
+[Code signing policy](#code-signing-policy)); once it's live, Windows release
+binaries are signed and Smart App Control lets them run. Until then,
+[Application control](#application-control-windows) covers signing your own
+builds and trusting them with an App Control policy.
 
 Releases after v0.1.0 also carry build provenance: a signed record that each
 binary was built by this repository's release workflow. Check it with the
@@ -49,6 +52,32 @@ gh attestation verify pool-0.1.4-windows-amd64.exe --repo montjeffrey/compute-po
 ```
 
 Release tags from v0.1.1 on are signed, and show as **Verified** on GitHub.
+
+### Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io),
+certificate by [SignPath Foundation](https://signpath.org). (The application
+is pending; until it's approved, releases are unsigned.)
+
+Only Windows binaries built by this repository's release workflow on
+GitHub-hosted runners, from a release tag the maintainer pushes, are
+submitted for signing, and each signing request is approved by hand before
+anything is signed. Setup and the release steps are
+in [docs/code-signing.md](docs/code-signing.md).
+
+- Committers and reviewers: [Jeffrey Montoya](https://github.com/montjeffrey),
+  the sole maintainer. Changes from anyone else arrive as pull requests and
+  are reviewed before merging.
+- Approvers: [Jeffrey Montoya](https://github.com/montjeffrey).
+
+Everyone with these roles uses multi-factor authentication on GitHub and
+SignPath.
+
+Privacy: this program will not transfer any information to other networked
+systems unless specifically requested by the user or the person installing or
+operating it. pool connects only to the agents on the devices you add to your
+pool (over your Tailscale network) and sends them the jobs you run; it
+contacts no other server.
 
 ## Splitting work with `pool map`
 

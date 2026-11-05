@@ -10,14 +10,22 @@ name: Release
 # attestation tying it to this repository and workflow; GitHub only offers
 # attestations for public repositories on this plan, so that step is skipped
 # while the repository is private.
+#
+# Once SignPath Foundation has accepted the project (docs/code-signing.md),
+# the Windows binaries are sent to SignPath to be signed before the release's
+# checksums and attestations are made, so both cover the signed files.
+# Signing waits for a maintainer to approve the request in SignPath. Until the
+# repository variable SIGNPATH_ORGANIZATION_ID is set, the sign job is skipped
+# and the binaries ship unsigned as before.
 
 on:
   push:
     tags: ["v*"]
 
 # No permissions by default. The build job, which runs the tests and a
-# third-party module, can only read; the job that signs and publishes has the
-# write permissions and runs nothing but downloading, checking, attesting and
+# third-party module, can only read. The sign job holds the SignPath token and
+# can only read this run's artifacts. The job that publishes has the write
+# permissions and runs nothing but downloading, checking, attesting and
 # publishing the built files.
 permissions: {}
 
@@ -26,6 +34,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      unsigned-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -68,9 +78,71 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 1
+      # Only the Windows binaries, so they sit at the root of the artifact's
+      # zip, where .signpath/artifact-configuration.xml expects them.
+      - name: Upload Windows binaries for signing
+        id: unsigned
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-windows
+          path: dist/pool-*-windows-*.exe
+          if-no-files-found: error
+          retention-days: 1
+          # A re-run of this job uploads again into the same workflow run.
+          overwrite: true
+
+  sign:
+    needs: build
+    if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+    runs-on: ubuntu-latest
+    # The SignPath token is a secret of this environment only, which accepts
+    # release tags only (docs/code-signing.md).
+    environment: signpath
+    # Leaves room for the signing request to be approved (up to an hour).
+    timeout-minutes: 90
+    permissions:
+      # SignPath downloads the unsigned artifact and reads the job's details
+      # with the workflow's token.
+      actions: read
+      contents: read
+    steps:
+      - name: Version
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Sign Windows binaries
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'compute-pool' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          github-artifact-id: ${{ needs.build.outputs.unsigned-artifact-id }}
+          # The artifact configuration checks the binaries carry this version.
+          parameters: |
+            version: ${{ toJSON(steps.version.outputs.version) }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed
+      - name: Checksums of the signed files
+        run: |
+          (cd signed && sha256sum pool-*-windows-*.exe > SHA256SUMS)
+          cat signed/SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-windows
+          path: signed/
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
 
   publish:
-    needs: build
+    needs: [build, sign]
+    # Runs when signing succeeded or was skipped (not set up yet), never when
+    # it failed.
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.sign.result == 'success' || needs.sign.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -86,6 +158,23 @@ jobs:
           path: dist/
       - name: Check the downloaded files
         run: cd dist && sha256sum -c SHA256SUMS
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: ${{ needs.sign.result == 'success' }}
+        with:
+          name: signed-windows
+          path: signed/
+      - name: Replace binaries with the signed ones
+        if: ${{ needs.sign.result == 'success' }}
+        run: |
+          (cd signed && sha256sum -c SHA256SUMS)
+          for f in dist/pool-*-windows-*.exe; do
+            name="$(basename "$f")"
+            if [ ! -f "signed/$name" ]; then echo "SignPath returned no signed $name"; ls -la signed; exit 1; fi
+            if cmp -s "$f" "signed/$name"; then echo "signed/$name is identical to the unsigned build"; exit 1; fi
+            cp "signed/$name" "$f"
+          done
+          (cd dist && sha256sum pool-* > SHA256SUMS)
+          cat dist/SHA256SUMS
       - name: Attest build provenance
         if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -95,7 +184,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          # Set the repository variable RELEASE_AS_DRAFT to true to publish a
+          # draft only, e.g. for a trial run with SignPath's test signing.
+          DRAFT: ${{ vars.RELEASE_AS_DRAFT }}
         run: |
           notes="docs/releases/$TAG.md"
           if [ -f "$notes" ]; then flags=(--notes-file "$notes"); else flags=(--generate-notes); fi
+          if [ "$DRAFT" = true ]; then flags+=(--draft); fi
           gh release create "$TAG" dist/* --title "$TAG" --verify-tag "${flags[@]}"
