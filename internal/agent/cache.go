@@ -141,7 +141,7 @@ func (c *fileCache) copyTo(hash, dst string) error {
 		return fmt.Errorf("cached file %s: %w", hash[:12], err)
 	}
 	defer src.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o700)
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o700)
 	if err != nil {
 		return err
 	}

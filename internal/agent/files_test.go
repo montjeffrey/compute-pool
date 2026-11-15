@@ -2,6 +2,8 @@ package agent
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,5 +42,32 @@ func TestCollectDoesNotFollowLinksOutOfJobDir(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "ok.txt") {
 		t.Errorf("ok.txt was not sent: %s", buf.String())
+	}
+}
+
+func TestWriteInputsRejectsDuplicatePaths(t *testing.T) {
+	cache, err := newFileCache(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := []byte("program")
+	sum := sha256.Sum256(good)
+	hash := hex.EncodeToString(sum[:])
+	if err := cache.put(hash, good); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	files := []proto.InputFile{
+		{Path: "helper.exe", SHA256: hash, Cached: true},
+		{Path: "./helper.exe", Data: []byte("POISON")},
+	}
+	_, err = writeInputs(dir, files, cache, "helper.exe")
+	if err == nil || !strings.Contains(err.Error(), "more than once") {
+		t.Fatalf("err = %v, want a duplicate-path refusal", err)
+	}
+	got, err := os.ReadFile(filepath.Join(cache.dir, hash))
+	if err != nil || !bytes.Equal(got, good) {
+		t.Errorf("cache entry = %q, %v; want it unchanged", got, err)
 	}
 }

@@ -21,11 +21,22 @@ var errCollectTooBig = fmt.Errorf("collected files exceed %d MiB", proto.MaxColl
 // file at path program (see shippedProgram) is linked from the cache instead.
 func writeInputs(dir string, files []proto.InputFile, cache *fileCache, program string) (map[string]string, error) {
 	written := make(map[string]string, len(files))
+	// Two entries for one file would make the second write through the hard
+	// link the first one may have made into the cache.
+	names := make(map[string]bool, len(files))
 	for _, f := range files {
 		rel, err := proto.CleanRelPath(f.Path)
 		if err != nil {
 			return nil, fmt.Errorf("input file: %w", err)
 		}
+		key := rel
+		if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+			key = strings.ToLower(rel) // these file systems ignore case
+		}
+		if names[key] {
+			return nil, fmt.Errorf("input file %s: sent more than once", rel)
+		}
+		names[key] = true
 		dst := filepath.Join(dir, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 			return nil, err
@@ -55,13 +66,27 @@ func writeInputs(dir string, files []proto.InputFile, cache *fileCache, program 
 				}
 			}
 			// Owner-executable so shipped programs and scripts can run.
-			if err := os.WriteFile(dst, f.Data, 0o700); err != nil {
+			if err := writeNew(dst, f.Data); err != nil {
 				return nil, err
 			}
 		}
 		written[rel] = dst
 	}
 	return written, nil
+}
+
+// writeNew creates dst, which must not exist yet, so it can never write
+// through a link into another file.
+func writeNew(dst string, data []byte) error {
+	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o700)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // shippedProgram returns the cleaned path of the shipped file that argv[0]
