@@ -19,9 +19,14 @@ pool map --inputs 'data/*.csv' --ship analyze.py --collect out -- python analyze
   <img alt="The pool dashboard: five devices with their status, CPU load, idle CPUs, job slots and power, followed by running and recent jobs" src="docs/images/dashboard-light.png">
 </picture>
 
-Status: **v0.1.0**, early. Works on Windows (tested on two machines); Linux and
-macOS build and pass the test suite in CI. See [SECURITY.md](SECURITY.md)
-before running an agent.
+Status: early. Works on Windows (tested on two machines); Linux and macOS
+build and pass the test suite in CI. See [SECURITY.md](SECURITY.md) before
+running an agent.
+
+This README describes `main`. The latest published release is v0.1.4, which
+predates `pool setup`, `pool advise`, `pool report`, `pool map --dry-run`, the
+live job limit (CPU and memory) and the log an agent serves at `/v1/log`.
+Until the next release, build from source (see [Build](#build)) to get them.
 
 ## Install
 
@@ -152,12 +157,20 @@ It **pauses** (refuses new jobs, with a reason) when:
 - the device is **on battery**, unless started with `--lend-on-battery`;
 - CPU use is at or above `--busy-threshold` (default 80%), whether from the
   owner's own work or from jobs already running;
-- all `--max-jobs` slots are taken.
+- free memory is low: an agent keeps a reserve for you (the larger of 1 GB and
+  a tenth of the device's memory; there is no flag for it) and divides what is
+  left among jobs, each assumed to need `--job-memory` MB until the agent has
+  measured finished ones. The agent's job limit drops with free memory, and at
+  zero it takes no jobs, even for `--node`;
+- all `--max-jobs` slots are taken (`--max-jobs` is a ceiling: CPU use by other
+  programs and free memory can lower the limit further, live).
 
 `pool run` without `--node` asks every agent for its status, ranks the ready
 ones by **idle CPUs** (then by free job slots), and sends the job to the best
 one. If that agent declines in the meantime, the next one is tried. When no
-device can take the job, the error lists why for each device.
+device can take the job, the error lists why for each device. `pool map` stops
+the same way when every agent is paused, rather than waiting, so run it again
+once memory or CPU is free.
 
 ```
 DEVICE                 OS             CPUS  IDLE  LOAD  JOBS  POWER        STATUS
@@ -257,7 +270,9 @@ that set small and the agent's reach narrow.
 
 ## Build
 
-Requires Go 1.24+ and Tailscale signed in on every device.
+Requires Go 1.24 or newer and Tailscale signed in on every device. `go.mod`
+pins the `go1.27.4` toolchain, which an older Go downloads on its own
+(`GOTOOLCHAIN=auto`, the default) unless it is already installed.
 
 ```powershell
 go build -trimpath -o bin/pool.exe ./cmd/pool
@@ -377,7 +392,8 @@ don't make one.
 CPUs, job slots, power) and of running and recent jobs. It refreshes every
 2 seconds. By default it listens on `127.0.0.1:7471`, reachable only from this
 device, and rejects requests whose Host header doesn't match, which blocks
-DNS-rebinding attacks. `--tailnet --allow phone,laptop` serves it on the
+DNS-rebinding attacks. It refuses any other `--listen` address unless you pass
+`--tailnet`, because only `--tailnet` checks who is asking. `--tailnet --allow phone,laptop` serves it on the
 Tailscale address so those devices can open it, with the same identity check
 the agents use.
 
@@ -385,16 +401,22 @@ the agents use.
 
 | Command | Flags |
 |---|---|
-| `pool agent` | `--allow a,b` devices that may submit jobs (this device is always allowed) · `--max-jobs N` (default: half the logical CPUs) · `--lend-on-battery` · `--busy-threshold 80` (0 = never pause) · `--cache-mb 2048` · `--port 7470` · `--work-dir` · `--listen` |
-| `pool run [--node N] -- cmd args...` | `--node auto` (default) or a device name/IP · `--shell` run via cmd.exe or /bin/sh · `--ship` · `--collect` · `--out pool-out` · `--timeout 10m` · `--env K=V` (repeatable) · `-v` shows where the job went · `--probe-timeout 1s` |
-| `pool map (--range A..B \| --items F \| --inputs GLOB) -- cmd {}` | `--ship` · `--collect` · `--out pool-out` · `--nodes a,b` · `--jobs N` · `--retries 2` · `--speculate` · `--keep-order` · `--shell` · `--timeout` · `--env K=V` · `-v` |
-| `pool nodes` | `--timeout 1s` |
-| `pool report` | `--log FILE` (repeatable; logs read from files, measurements still asked of the agents) · `--nodes a,b` · `--min-jobs 30` · `--run-gap 2s` · `--json` · `--timeout 1s` |
-| `pool dashboard` | `--open` · `--listen 127.0.0.1:7471` · `--tailnet` · `--allow a,b` |
+| `pool setup` | Measures this device, recommends agent settings and, once you confirm, installs the agent with them (on Linux and macOS it prints the `pool agent` command instead). `--json` print the recommendation and change nothing · `--yes` apply without asking · `--no-measure` use the saved measurement or the specs · `--measure-time 2s` · `--allow a,b` · `--keep N` threads to keep free for you · `--job-memory 512` MB per job |
+| `pool agent` | `--allow a,b` devices that may submit jobs (this device is always allowed) · `--max-jobs N` (default: half the logical CPUs) · `--lend-on-battery` · `--busy-threshold 80` (0 = never pause) · `--cache-mb 2048` · `--job-memory 512` MB to assume each job needs until jobs have been measured · `--port 7470` · `--work-dir` · `--listen` · `--log-file FILE` log to a file instead of stderr · `--hide-console` detach from the console window (the startup task uses it) |
+| `pool run [--node N] -- cmd args...` | `--node auto` (default) or a device name/IP · `--shell` run via cmd.exe or /bin/sh · `--ship` · `--collect` · `--out pool-out` · `--timeout D` (0 = no limit) · `--env K=V` (repeatable) · `-v` shows where the job went · `--probe-timeout 1s` · `--port 7470` |
+| `pool map (--range A..B \| --items F \| --inputs GLOB) -- cmd {}` | `--ship` · `--collect` · `--out pool-out` · `--nodes a,b` · `--jobs N` · `--retries 2` · `--speculate` · `--keep-order` · `--shell` · `--timeout` · `--env K=V` · `-v` · `--dry-run` predict how the tasks would spread over the devices and run nothing · `--task-time D` with `--dry-run`, how long one task takes alone on this device · `--probe-timeout 1s` · `--port 7470` |
+| `pool nodes` | `--timeout 1s` · `--port 7470` |
+| `pool advise` | Compares every device: capacity, expected speedup, what to change. `--json` · `--timeout 1s` · `--port 7470` |
+| `pool report` | `--log FILE` (repeatable; logs read from files, measurements still asked of the agents) · `--nodes a,b` · `--min-jobs 30` · `--run-gap 2s` · `--json` · `--timeout 1s` · `--port 7470` |
+| `pool dashboard` | `--open` · `--listen 127.0.0.1:7471` (a non-loopback address needs `--tailnet`) · `--tailnet` · `--allow a,b` · `--port 7470` (the agents' port, not the dashboard's) |
 | `pool install` / `pool uninstall` | `pool install` takes the same flags as `pool agent` (Windows) |
+| `pool version` | Prints the version and platform. |
 
 `pool run` exits with the remote program's exit code. The agent itself reports
-127 (couldn't start), 124 (timed out) and 130 (canceled).
+127 (couldn't start), 124 (timed out) and 130 (canceled). If the program
+succeeded but its `--collect` results could not be brought back (an unsafe path,
+or a pattern that matched nothing), `pool run` exits 1 instead of 0, so a
+script doesn't carry on without them.
 Jobs see `POOL_JOB_ID` and `POOL_NODE` in their environment.
 
 ## Development
