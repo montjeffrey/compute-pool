@@ -94,3 +94,29 @@ func TestCacheRequiresLowercaseHashes(t *testing.T) {
 		t.Error("the lowercase entry was lost")
 	}
 }
+
+func TestStaleCleanupOnlyRemovesJobFolders(t *testing.T) {
+	work := t.TempDir()
+	for _, d := range []string{"job-123456", "job-7", "job-tracker", "job-", "jobs", "notes"} {
+		if err := os.MkdirAll(filepath.Join(work, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(work, d, "f.txt"), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(work, "job-99"), []byte("a file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	removeStaleJobDirs(work)
+	for _, gone := range []string{"job-123456", "job-7"} {
+		if _, err := os.Stat(filepath.Join(work, gone)); !os.IsNotExist(err) {
+			t.Errorf("%s was not removed", gone)
+		}
+	}
+	for _, kept := range []string{"job-tracker", "job-", "jobs", "notes", "job-99"} {
+		if _, err := os.Stat(filepath.Join(work, kept)); err != nil {
+			t.Errorf("%s was removed: %v", kept, err)
+		}
+	}
+}

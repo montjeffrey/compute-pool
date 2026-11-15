@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -203,11 +204,7 @@ func New(cfg Config) (*Agent, error) {
 	}
 	// No job is running yet, so any job folder here was left by an agent
 	// that crashed or was killed.
-	if stale, err := filepath.Glob(filepath.Join(cfg.WorkDir, "job-*")); err == nil {
-		for _, p := range stale {
-			os.RemoveAll(p)
-		}
-	}
+	removeStaleJobDirs(cfg.WorkDir)
 	if cfg.Logger == nil {
 		cfg.Logger = log.New(os.Stderr, "", log.LstdFlags)
 	}
@@ -257,6 +254,25 @@ func (a *Agent) missingFiles(req proto.RunRequest) []string {
 		}
 	}
 	return missing
+}
+
+// jobDirName matches the folders os.MkdirTemp(workDir, "job-") creates: the
+// prefix and a decimal number. Nothing else in the work directory is ours.
+var jobDirName = regexp.MustCompile(`^job-[0-9]+$`)
+
+// removeStaleJobDirs deletes job folders left in workDir by an agent that
+// crashed or was killed. A folder the user keeps there under a name like
+// "job-tracker" is not touched.
+func removeStaleJobDirs(workDir string) {
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() && jobDirName.MatchString(e.Name()) {
+			os.RemoveAll(filepath.Join(workDir, e.Name()))
+		}
+	}
 }
 
 // Running reports how many jobs are executing.
