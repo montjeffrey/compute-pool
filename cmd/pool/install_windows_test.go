@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
@@ -126,5 +127,20 @@ func TestTaskCommandLineQuoting(t *testing.T) {
 	}
 	if strings.Join(got, "|") != strings.Join([]string{"agent", "--allow", "laptop,desktop", "--work-dir", `C:\Users\A B\jobs`, "--log-file", `C:\Users\A B\agent.log`, "--hide-console"}, "|") {
 		t.Errorf("parsed back as %q", got)
+	}
+}
+
+// Both cases return before anything is stopped or removed.
+func TestUninstallHelpAndExtraArguments(t *testing.T) {
+	var out, errb bytes.Buffer
+	if code := run([]string{"uninstall", "--help"}, &out, &errb); code != 0 {
+		t.Errorf("uninstall --help exit %d, stderr %q", code, errb.String())
+	}
+	if !strings.Contains(errb.String(), "Usage: pool uninstall") {
+		t.Errorf("uninstall --help did not print usage: %q", errb.String())
+	}
+	errb.Reset()
+	if code := run([]string{"uninstall", "extra"}, &out, &errb); code != 1 || !strings.Contains(errb.String(), `unexpected argument "extra"`) {
+		t.Errorf("uninstall extra: exit %d, stderr %q", code, errb.String())
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -202,7 +203,7 @@ func cmdInstall(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		fmt.Fprintln(stderr, "Usage: pool install [agent flags]   (the same flags as pool agent)")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
@@ -268,8 +269,17 @@ func parseInstallOutput(out string) (mode, state string, err error) {
 }
 
 func cmdUninstall(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	if len(args) > 0 {
-		return fmt.Errorf("unexpected argument %q", args[0])
+	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		fmt.Fprintln(stderr, "Usage: pool uninstall")
+		fmt.Fprintln(stderr, "Stops the automatic agent and removes its startup task.")
+	}
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
 	}
 	p, err := defaultInstallPaths()
 	if err != nil {
