@@ -397,3 +397,19 @@ func TestDashboardRefusesNonLoopbackWithoutTailnet(t *testing.T) {
 		}
 	}
 }
+
+func TestJobExitCode(t *testing.T) {
+	for _, c := range []struct {
+		res  client.Result
+		want int
+	}{
+		{client.Result{}, 0},
+		{client.Result{ExitCode: 3}, 3},
+		{client.Result{RemoteError: "nothing matched *.res"}, 1},
+		{client.Result{ExitCode: 124, RemoteError: "job timed out after 3s"}, 124},
+	} {
+		if got := jobExitCode(c.res); got != c.want {
+			t.Errorf("jobExitCode(%+v) = %d, want %d", c.res, got, c.want)
+		}
+	}
+}

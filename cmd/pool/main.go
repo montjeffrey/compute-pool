@@ -365,9 +365,20 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 		if len(res.Files) > 0 {
 			fmt.Fprintf(stderr, "pool: %d file(s) collected into %s\n", len(res.Files), *outDir)
 		}
-		return res.ExitCode, nil
+		return jobExitCode(res), nil
 	}
 	return 1, errors.New("no device accepted the job")
+}
+
+// jobExitCode is the exit status of pool run: the program's own, except that a
+// job that succeeded but whose results could not be brought back (an unsafe or
+// unmatched --collect pattern, say) fails, so a script does not carry on with
+// files that are missing.
+func jobExitCode(res client.Result) int {
+	if res.ExitCode == 0 && res.RemoteError != "" {
+		return 1
+	}
+	return res.ExitCode
 }
 
 func defaultWorkDir() string {
