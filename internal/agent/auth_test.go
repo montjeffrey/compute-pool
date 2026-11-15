@@ -64,8 +64,8 @@ func TestNonTailnetAddressesRejectedWithoutLookup(t *testing.T) {
 		"100.64.0.1": {NodeName: "desktop", LoginName: "alice@github"},
 	}, &calls)
 	for _, ip := range []string{"192.168.1.10", "127.0.0.1", "8.8.8.8", "::1", "fe80::1", "not-an-ip"} {
-		if _, err := a.Authorize(context.Background(), ip); !errors.Is(err, ErrForbidden) {
-			t.Errorf("Authorize(%s) err = %v, want forbidden", ip, err)
+		if _, err := a.Authorize(context.Background(), ip); !errors.Is(err, ErrForbidden) || !errors.Is(err, ErrNotTailnet) {
+			t.Errorf("Authorize(%s) err = %v, want forbidden and not-tailnet", ip, err)
 		}
 	}
 	if calls != 0 {

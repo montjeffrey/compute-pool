@@ -195,6 +195,8 @@ func probeAll(ctx context.Context, st tsutil.Status, c *client.Client, timeout t
 
 func probeStatus(err error) string {
 	switch {
+	case errors.Is(err, client.ErrNotTailnet):
+		return "agent only accepts Tailscale addresses, and this connection did not come from one"
 	case errors.Is(err, client.ErrForbidden):
 		return "agent refuses this device (add it to --allow)"
 	case errors.Is(err, client.ErrBusy):

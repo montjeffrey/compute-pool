@@ -990,6 +990,25 @@ func TestUnconfirmedCallerIsBusyNotForbidden(t *testing.T) {
 	}
 }
 
+type notTailnet struct{}
+
+func (notTailnet) Authorize(context.Context, string) (agent.Identity, error) {
+	return agent.Identity{}, fmt.Errorf("%w: %w", agent.ErrForbidden, agent.ErrNotTailnet)
+}
+
+func TestCallerOutsideTailnetGetsAccurateRefusal(t *testing.T) {
+	h := newHarness(t, 1, notTailnet{})
+	_, err := h.client.Info(context.Background(), h.host)
+	if !errors.Is(err, client.ErrNotTailnet) || !errors.Is(err, client.ErrForbidden) {
+		t.Errorf("err = %v, want ErrNotTailnet and ErrForbidden", err)
+	}
+	// An allow-list refusal stays a plain one.
+	h = newHarness(t, 1, denyAll{})
+	if _, err := h.client.Info(context.Background(), h.host); errors.Is(err, client.ErrNotTailnet) {
+		t.Errorf("allow-list refusal reported as not-tailnet: %v", err)
+	}
+}
+
 func TestDisallowedCallerIsForbidden(t *testing.T) {
 	h := newHarness(t, 1, denyAll{})
 	if _, err := h.client.Info(context.Background(), h.host); !errors.Is(err, client.ErrForbidden) {

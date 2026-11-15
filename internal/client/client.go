@@ -23,6 +23,11 @@ import (
 // ErrForbidden means the agent refused this device.
 var ErrForbidden = errors.New("this device is not allowed by the agent")
 
+// ErrNotTailnet is wrapped together with ErrForbidden when the agent refused
+// the connection because it did not come from a Tailscale address, which no
+// allow list can fix.
+var ErrNotTailnet = errors.New("the connection did not come from a Tailscale address")
+
 // ErrUnreachable means no connection was made to the agent, so nothing ran
 // and the job can safely go elsewhere.
 var ErrUnreachable = errors.New("agent unreachable")
@@ -341,6 +346,10 @@ func checkStatus(resp *http.Response) error {
 	case http.StatusOK:
 		return nil
 	case http.StatusForbidden:
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if strings.TrimSpace(string(msg)) == proto.NotTailnetMessage {
+			return fmt.Errorf("%w: %w", ErrForbidden, ErrNotTailnet)
+		}
 		return ErrForbidden
 	}
 	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))

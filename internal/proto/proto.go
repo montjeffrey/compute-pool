@@ -23,6 +23,11 @@ import (
 // DefaultPort is the TCP port agents listen on.
 const DefaultPort = 7470
 
+// NotTailnetMessage is the body of the 403 an agent sends to a caller whose
+// address is outside the Tailscale ranges. Adding the caller to --allow cannot
+// help it, so the client says something else than for an allowed-list refusal.
+const NotTailnetMessage = "caller is not on a Tailscale address"
+
 // Version is reported by agents and the CLI. Release builds set it from the
 // git tag with -ldflags "-X github.com/montjeffrey/compute-pool/internal/proto.Version=…".
 var Version = "dev"

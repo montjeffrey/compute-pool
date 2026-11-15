@@ -70,6 +70,8 @@ func buildState(results []probeResult, jobs map[string]proto.Jobs, now time.Time
 				s.Ready++
 				s.IdleCPUs += info.IdleCPUs
 			}
+		case errors.Is(r.err, client.ErrNotTailnet):
+			d.Status, d.Detail = "refused", probeStatus(r.err)
 		case errors.Is(r.err, client.ErrForbidden):
 			d.Status, d.Detail = "refused", "its agent does not allow this device"
 		case errors.Is(r.err, client.ErrBusy):

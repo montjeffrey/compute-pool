@@ -332,6 +332,10 @@ func (a *Agent) authenticate(next http.Handler) http.Handler {
 				http.Error(w, "can't confirm who is asking yet; try again shortly", http.StatusServiceUnavailable)
 				return
 			}
+			if errors.Is(err, ErrNotTailnet) {
+				http.Error(w, proto.NotTailnetMessage, http.StatusForbidden)
+				return
+			}
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}

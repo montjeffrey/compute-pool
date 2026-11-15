@@ -16,6 +16,10 @@ import (
 // ErrForbidden marks a caller that was identified but is not allowed.
 var ErrForbidden = errors.New("forbidden")
 
+// ErrNotTailnet marks a caller whose address is outside the Tailscale ranges.
+// It is always returned together with ErrForbidden.
+var ErrNotTailnet = errors.New("not a Tailscale address")
+
 // Identity is the tailnet device behind a request.
 type Identity struct {
 	Node  string
@@ -136,7 +140,7 @@ func (a *TailnetAuthorizer) Authorize(ctx context.Context, remoteIP string) (Ide
 	// Anything else is refused before running tailscale, so a scanner on a
 	// LAN (possible with --listen) cannot make the agent spawn processes.
 	if !inTailnetRange(remoteIP) {
-		return Identity{}, fmt.Errorf("%w: %s is not a Tailscale address", ErrForbidden, remoteIP)
+		return Identity{}, fmt.Errorf("%w: %w: %s", ErrForbidden, ErrNotTailnet, remoteIP)
 	}
 	who, err := a.whois(ctx, remoteIP)
 	if err != nil {
