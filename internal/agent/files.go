@@ -92,9 +92,16 @@ func shippedProgram(req proto.RunRequest) string {
 }
 
 // collectOutputs sends every regular file matching patterns back as file
-// frames. Symbolic links and other special files are skipped so a job cannot
-// point the agent at data outside its directory.
+// frames. The job directory is opened as a root, so no path component, not
+// only the last, can lead outside it through a symbolic link or junction.
+// Links and other special files are skipped.
 func collectOutputs(dir string, patterns []string, fw *proto.FrameWriter) error {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	fsys := root.FS()
 	seen := make(map[string]bool)
 	var total int64
 	var unmatched []string
@@ -105,7 +112,7 @@ func collectOutputs(dir string, patterns []string, fw *proto.FrameWriter) error 
 		}
 		// Match within the job directory itself, so glob characters in the
 		// directory's own path can't change what the pattern selects.
-		matches, err := fs.Glob(os.DirFS(dir), rel)
+		matches, err := fs.Glob(fsys, rel)
 		if err != nil {
 			return fmt.Errorf("pattern %q: %w", pat, err)
 		}
@@ -113,19 +120,17 @@ func collectOutputs(dir string, patterns []string, fw *proto.FrameWriter) error 
 			unmatched = append(unmatched, pat)
 		}
 		for _, m := range matches {
-			full := filepath.Join(dir, filepath.FromSlash(m))
-			err := filepath.WalkDir(full, func(p string, d fs.DirEntry, err error) error {
+			if fi, err := root.Lstat(m); err != nil || !fi.Mode().IsRegular() && !fi.IsDir() {
+				continue // links and devices are skipped
+			}
+			err := fs.WalkDir(fsys, m, func(p string, d fs.DirEntry, err error) error {
 				if err != nil {
 					return err
 				}
 				if !d.Type().IsRegular() {
 					return nil // directories are walked; links and devices are skipped
 				}
-				r, err := filepath.Rel(dir, p)
-				if err != nil {
-					return nil
-				}
-				slash, err := proto.CleanRelPath(filepath.ToSlash(r))
+				slash, err := proto.CleanRelPath(p)
 				if err != nil || seen[slash] {
 					return nil
 				}
@@ -137,7 +142,7 @@ func collectOutputs(dir string, patterns []string, fw *proto.FrameWriter) error 
 				if total += info.Size(); total > proto.MaxCollectBytes {
 					return errCollectTooBig
 				}
-				return sendFile(p, slash, fw)
+				return sendFile(root, p, slash, fw)
 			})
 			if err != nil {
 				return err
@@ -150,8 +155,8 @@ func collectOutputs(dir string, patterns []string, fw *proto.FrameWriter) error 
 	return nil
 }
 
-func sendFile(src, rel string, fw *proto.FrameWriter) error {
-	f, err := os.Open(src)
+func sendFile(root *os.Root, name, rel string, fw *proto.FrameWriter) error {
+	f, err := root.Open(name)
 	if err != nil {
 		return err
 	}
