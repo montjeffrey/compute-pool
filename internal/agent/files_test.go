@@ -143,3 +143,44 @@ func TestCollectReportsAPatternThatMatchesOnlyALink(t *testing.T) {
 		t.Errorf("*.txt: %v", err)
 	}
 }
+
+// The input writers must never open an existing file, so a hard link to a
+// cache entry can't be written through. This fails if O_EXCL is dropped.
+func TestInputWritersNeverOverwriteAnExistingFile(t *testing.T) {
+	cache, err := newFileCache(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := []byte("cached")
+	sum := sha256.Sum256(good)
+	hash := hex.EncodeToString(sum[:])
+	if err := cache.put(hash, good); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	existing := func(name string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("original"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	check := func(what, p string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Errorf("%s: overwrote an existing file", what)
+		}
+		if got, _ := os.ReadFile(p); string(got) != "original" {
+			t.Errorf("%s: file now holds %q", what, got)
+		}
+	}
+	p := existing("a")
+	check("writeNew", p, writeNew(p, []byte("POISON")))
+	p = existing("b")
+	check("copyTo", p, cache.copyTo(hash, p))
+
+	// Through writeInputs, with a file already in the job folder.
+	p = existing("c.txt")
+	_, err = writeInputs(dir, []proto.InputFile{{Path: "c.txt", Data: []byte("POISON")}}, cache, "")
+	check("writeInputs", p, err)
+}
