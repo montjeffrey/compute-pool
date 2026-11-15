@@ -100,7 +100,7 @@ func (c *Client) Jobs(ctx context.Context, host string) (proto.Jobs, error) {
 		return proto.Jobs{}, err
 	}
 	var jobs proto.Jobs
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxStatusBytes)).Decode(&jobs); err != nil {
+	if err := decodeStatus(resp.Body, &jobs); err != nil {
 		return proto.Jobs{}, fmt.Errorf("decode jobs: %w", err)
 	}
 	return jobs, nil
@@ -110,6 +110,16 @@ func (c *Client) Jobs(ctx context.Context, host string) (proto.Jobs, error) {
 // misbehaving agent cannot make a client buffer an endless reply. Real ones
 // are a few kilobytes.
 const maxStatusBytes = 4 << 20
+
+// decodeStatus decodes one JSON value of at most maxStatusBytes from r.
+func decodeStatus(r io.Reader, v any) error {
+	lr := &io.LimitedReader{R: r, N: maxStatusBytes}
+	err := json.NewDecoder(lr).Decode(v)
+	if err != nil && lr.N <= 0 {
+		return fmt.Errorf("the reply is larger than the %d MiB limit", maxStatusBytes>>20)
+	}
+	return err
+}
 
 // ErrNoLog means the agent doesn't serve its log: it is older than this
 // client, or it logs to the console instead of a file.
@@ -178,7 +188,7 @@ func (c *Client) Info(ctx context.Context, host string) (proto.Info, error) {
 		return proto.Info{}, err
 	}
 	var info proto.Info
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxStatusBytes)).Decode(&info); err != nil {
+	if err := decodeStatus(resp.Body, &info); err != nil {
 		return proto.Info{}, fmt.Errorf("decode info: %w", err)
 	}
 	return info, nil

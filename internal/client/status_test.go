@@ -19,10 +19,10 @@ func TestStatusAnswersAreBounded(t *testing.T) {
 	host, port, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
 	c := New()
 	c.Port, _ = strconv.Atoi(port)
-	if _, err := c.Info(context.Background(), host); err == nil || !strings.Contains(err.Error(), "decode info") {
+	if _, err := c.Info(context.Background(), host); err == nil || !strings.Contains(err.Error(), "decode info") || !strings.Contains(err.Error(), "larger than") {
 		t.Errorf("Info accepted an oversized answer: %v", err)
 	}
-	if _, err := c.Jobs(context.Background(), host); err == nil || !strings.Contains(err.Error(), "decode jobs") {
+	if _, err := c.Jobs(context.Background(), host); err == nil || !strings.Contains(err.Error(), "decode jobs") || !strings.Contains(err.Error(), "larger than") {
 		t.Errorf("Jobs accepted an oversized answer: %v", err)
 	}
 }
