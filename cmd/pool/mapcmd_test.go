@@ -435,3 +435,15 @@ func TestBadFlagPrintsUsageOnce(t *testing.T) {
 		t.Errorf("-h exit %d", code)
 	}
 }
+
+func TestPausedHint(t *testing.T) {
+	paused := probeResult{info: proto.Info{Accepting: false, Running: 0, MaxJobs: 4, Reason: "taking no jobs for now: low memory"}}
+	full := probeResult{info: proto.Info{Accepting: false, Running: 4, MaxJobs: 4, Reason: "all 4 job slots in use"}}
+	down := probeResult{err: client.ErrUnreachable}
+	if h := pausedHint([]probeResult{down, paused}); !strings.Contains(h, "low on free memory") {
+		t.Errorf("paused agent: hint = %q", h)
+	}
+	if h := pausedHint([]probeResult{down, full}); h != "" {
+		t.Errorf("full agent: hint = %q, want none", h)
+	}
+}

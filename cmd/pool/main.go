@@ -263,7 +263,7 @@ func pickTargets(ctx context.Context, c *client.Client, timeout time.Duration) (
 	if ranked := client.Rank(cands); len(ranked) > 0 {
 		return ranked, nil
 	}
-	return nil, fmt.Errorf("no device can take the job right now (%s)", explain(results))
+	return nil, fmt.Errorf("no device can take the job right now (%s)%s", explain(results), pausedHint(results))
 }
 
 // explain says, per device, why it cannot take work.
@@ -280,6 +280,18 @@ func explain(results []probeResult) string {
 		why = append(why, r.peer.Name+": "+reason)
 	}
 	return strings.Join(why, "; ")
+}
+
+// pausedHint explains, when an agent is up but has paused itself, what that
+// means and what to do. It is empty when no agent is paused (a device whose
+// job slots are all in use is busy, not paused).
+func pausedHint(results []probeResult) string {
+	for _, r := range results {
+		if r.err == nil && !r.info.Accepting && r.info.Running < r.info.MaxJobs {
+			return ". Agents pause when their device runs low on free memory, is busy with other programs or is on battery; try again shortly, or free memory on the lending devices"
+		}
+	}
+	return ""
 }
 
 type envFlag map[string]string

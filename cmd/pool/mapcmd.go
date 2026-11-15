@@ -498,7 +498,7 @@ func mapDevices(ctx context.Context, c *client.Client, only string, timeout time
 		cands = append(cands, client.Candidate{Name: r.peer.Name, Host: r.peer.IPv4, Info: r.info})
 	}
 	if len(client.Rank(cands)) == 0 {
-		return nil, fmt.Errorf("no device can take tasks right now (%s)", explain(results))
+		return nil, fmt.Errorf("no device can take tasks right now (%s)%s", explain(results), pausedHint(results))
 	}
 	return devs, nil
 }
