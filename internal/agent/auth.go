@@ -145,15 +145,20 @@ func (a *TailnetAuthorizer) Authorize(ctx context.Context, remoteIP string) (Ide
 		return Identity{}, fmt.Errorf("%w: %w: %s", ErrForbidden, ErrNotTailnet, remoteIP)
 	}
 	// A packet from a LAN host can carry a forged Tailscale source address.
-	// One that reached this agent through the tunnel was also addressed to
-	// this device's Tailscale address, so a connection that came in on any
-	// other local address (possible with --listen) is refused. HTTP servers
-	// record that address in the request context; callers without one, such
-	// as direct calls in tests, are not affected.
-	if la, ok := ctx.Value(http.LocalAddrContextKey).(net.Addr); ok {
-		if ap, err := netip.ParseAddrPort(la.String()); err == nil && !inTailnetRange(ap.Addr().String()) {
-			return Identity{}, fmt.Errorf("%w: %w: connection arrived on %s", ErrForbidden, ErrNotTailnet, ap.Addr())
-		}
+	// One that reached this agent through the tunnel was also addressed to a
+	// Tailscale address of this device, so a connection that came in on any
+	// other local address (possible with --listen) is refused. This checks the
+	// Tailscale ranges, not this device's own addresses: that would need the
+	// device's addresses here, kept current as they change. HTTP servers
+	// record the local address in the request context; a context without a
+	// usable one is refused, so a caller that drops it cannot skip the check.
+	la, _ := ctx.Value(http.LocalAddrContextKey).(net.Addr)
+	if la == nil {
+		return Identity{}, fmt.Errorf("%w: %w: no local address for the connection", ErrForbidden, ErrNotTailnet)
+	}
+	ap, err := netip.ParseAddrPort(la.String())
+	if err != nil || !inTailnetRange(ap.Addr().String()) {
+		return Identity{}, fmt.Errorf("%w: %w: connection arrived on %s", ErrForbidden, ErrNotTailnet, la)
 	}
 	who, err := a.whois(ctx, remoteIP)
 	if err != nil {

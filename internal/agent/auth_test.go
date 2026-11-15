@@ -3,8 +3,11 @@ package agent
 import (
 	"context"
 	"errors"
+	"io"
+	"log"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -13,6 +16,14 @@ import (
 
 	"github.com/montjeffrey/compute-pool/internal/tsutil"
 )
+
+// tailnetCtx is a request context for a connection that arrived on a Tailscale
+// address, as the HTTP server records it.
+func tailnetCtx() context.Context { return ctxAt("100.64.0.9:7470") }
+
+func ctxAt(local string) context.Context {
+	return context.WithValue(context.Background(), http.LocalAddrContextKey, net.Addr(net.TCPAddrFromAddrPort(netip.MustParseAddrPort(local))))
+}
 
 func fakeAuthorizer(whois map[string]tsutil.WhoIs, calls *int) *TailnetAuthorizer {
 	a := NewTailnetAuthorizer("alice@github", []string{"Desktop", " laptop ", ""})
@@ -48,7 +59,7 @@ func TestTailnetAuthorizer(t *testing.T) {
 		{"100.64.0.9", true, false},
 	}
 	for _, tt := range tests {
-		_, err := a.Authorize(context.Background(), tt.ip)
+		_, err := a.Authorize(tailnetCtx(), tt.ip)
 		if (err != nil) != tt.wantErr {
 			t.Errorf("Authorize(%s) err = %v, wantErr %v", tt.ip, err, tt.wantErr)
 		}
@@ -67,7 +78,7 @@ func TestNonTailnetAddressesRejectedWithoutLookup(t *testing.T) {
 		"100.64.0.1": {NodeName: "desktop", LoginName: "alice@github"},
 	}, &calls)
 	for _, ip := range []string{"192.168.1.10", "127.0.0.1", "8.8.8.8", "::1", "fe80::1", "not-an-ip"} {
-		if _, err := a.Authorize(context.Background(), ip); !errors.Is(err, ErrForbidden) || !errors.Is(err, ErrNotTailnet) {
+		if _, err := a.Authorize(tailnetCtx(), ip); !errors.Is(err, ErrForbidden) || !errors.Is(err, ErrNotTailnet) {
 			t.Errorf("Authorize(%s) err = %v, want forbidden and not-tailnet", ip, err)
 		}
 	}
@@ -87,7 +98,7 @@ func TestOwnerComparisonIsNotUnicodeFolding(t *testing.T) {
 		"100.64.0.7": {NodeName: "desktop", LoginName: "aliceK@github"},
 	}, &calls)
 	a.owner = "alicek@github"
-	if _, err := a.Authorize(context.Background(), "100.64.0.7"); !errors.Is(err, ErrForbidden) {
+	if _, err := a.Authorize(tailnetCtx(), "100.64.0.7"); !errors.Is(err, ErrForbidden) {
 		t.Errorf("look-alike login accepted: %v", err)
 	}
 }
@@ -98,12 +109,12 @@ func TestTailnetAuthorizerCachesSuccessfulLookups(t *testing.T) {
 		"100.64.0.1": {NodeName: "desktop", LoginName: "alice@github"},
 	}, &calls)
 	for i := 0; i < 3; i++ {
-		if _, err := a.Authorize(context.Background(), "100.64.0.1"); err != nil {
+		if _, err := a.Authorize(tailnetCtx(), "100.64.0.1"); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for i := 0; i < 3; i++ {
-		_, _ = a.Authorize(context.Background(), "100.64.0.9")
+		_, _ = a.Authorize(tailnetCtx(), "100.64.0.9")
 	}
 	if calls != 4 { // 1 cached success + 3 uncached failures
 		t.Errorf("lookup called %d times, want 4", calls)
@@ -146,7 +157,7 @@ func TestWhoisOutlivesCallerThatGivesUp(t *testing.T) {
 	var lookupErr error
 	a := blockingAuthorizer(release, &calls, &lookupErr)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(tailnetCtx())
 	cancel() // the caller has already given up
 	_, err := a.Authorize(ctx, "100.64.0.1")
 	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrForbidden) {
@@ -157,7 +168,7 @@ func TestWhoisOutlivesCallerThatGivesUp(t *testing.T) {
 	if lookupErr != nil {
 		t.Fatalf("lookup was canceled with its caller: %v", lookupErr)
 	}
-	if _, err := a.Authorize(context.Background(), "100.64.0.1"); err != nil {
+	if _, err := a.Authorize(tailnetCtx(), "100.64.0.1"); err != nil {
 		t.Fatalf("next request: %v", err)
 	}
 	if n := calls.Load(); n != 1 {
@@ -177,7 +188,7 @@ func TestConcurrentRequestsShareOneLookup(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, errs[i] = a.Authorize(context.Background(), "100.64.0.1")
+			_, errs[i] = a.Authorize(tailnetCtx(), "100.64.0.1")
 		}()
 	}
 	close(release)
@@ -209,7 +220,7 @@ func TestCachedLookupRefreshedBeforeExpiry(t *testing.T) {
 	authorize := func(at time.Duration) {
 		t.Helper()
 		clock.t = t0.Add(at)
-		if _, err := a.Authorize(context.Background(), "100.64.0.1"); err != nil {
+		if _, err := a.Authorize(tailnetCtx(), "100.64.0.1"); err != nil {
 			t.Fatalf("at %v: %v", at, err)
 		}
 		waitLookups(a)
@@ -242,17 +253,17 @@ func TestRemovedDeviceLosesAccessWithinTTL(t *testing.T) {
 	a.now = clock.now
 	t0 := clock.t
 
-	if _, err := a.Authorize(context.Background(), "100.64.0.1"); err != nil {
+	if _, err := a.Authorize(tailnetCtx(), "100.64.0.1"); err != nil {
 		t.Fatal(err)
 	}
 	delete(whois, "100.64.0.1") // removed from the tailnet: whois now fails
 	clock.t = t0.Add(50 * time.Second)
-	if _, err := a.Authorize(context.Background(), "100.64.0.1"); err != nil {
+	if _, err := a.Authorize(tailnetCtx(), "100.64.0.1"); err != nil {
 		t.Fatalf("within the TTL: %v", err)
 	}
 	waitLookups(a) // the failed refresh
 	clock.t = t0.Add(61 * time.Second)
-	if _, err := a.Authorize(context.Background(), "100.64.0.1"); err == nil {
+	if _, err := a.Authorize(tailnetCtx(), "100.64.0.1"); err == nil {
 		t.Fatal("removed device still allowed after the TTL")
 	}
 }
@@ -262,9 +273,7 @@ func TestConnectionMustArriveOnATailnetAddress(t *testing.T) {
 	a := fakeAuthorizer(map[string]tsutil.WhoIs{
 		"100.64.0.1": {NodeName: "desktop", LoginName: "alice@github"},
 	}, &calls)
-	at := func(local string) context.Context {
-		return context.WithValue(context.Background(), http.LocalAddrContextKey, net.Addr(net.TCPAddrFromAddrPort(netip.MustParseAddrPort(local))))
-	}
+	at := ctxAt
 	// A forged Tailscale source address on a LAN connection is refused before any lookup.
 	for _, local := range []string{"192.168.1.20:7470", "127.0.0.1:7470", "[::1]:7470"} {
 		if _, err := a.Authorize(at(local), "100.64.0.1"); !errors.Is(err, ErrForbidden) || !errors.Is(err, ErrNotTailnet) {
@@ -277,6 +286,66 @@ func TestConnectionMustArriveOnATailnetAddress(t *testing.T) {
 	for _, local := range []string{"100.64.0.9:7470", "[fd7a:115c:a1e0::9]:7470"} {
 		if _, err := a.Authorize(at(local), "100.64.0.1"); err != nil {
 			t.Errorf("connection on %s: %v", local, err)
+		}
+	}
+}
+
+func TestAuthorizeFailsClosedWithoutLocalAddress(t *testing.T) {
+	var calls int
+	a := fakeAuthorizer(map[string]tsutil.WhoIs{
+		"100.64.0.1": {NodeName: "desktop", LoginName: "alice@github"},
+	}, &calls)
+	noAddr := []context.Context{
+		context.Background(),
+		context.WithValue(context.Background(), http.LocalAddrContextKey, "not an address"),
+		context.WithValue(context.Background(), http.LocalAddrContextKey, net.Addr(&net.UnixAddr{Name: "sock", Net: "unix"})),
+	}
+	for i, ctx := range noAddr {
+		if _, err := a.Authorize(ctx, "100.64.0.1"); !errors.Is(err, ErrForbidden) {
+			t.Errorf("context %d: err = %v, want a refusal", i, err)
+		}
+	}
+	if calls != 0 {
+		t.Errorf("whois ran %d times", calls)
+	}
+}
+
+// The real authorizer, behind the real authenticate, with the request made to
+// look like it came from an allowed peer.
+func TestAuthenticateWithTailnetAuthorizer(t *testing.T) {
+	var calls int
+	auth := fakeAuthorizer(map[string]tsutil.WhoIs{
+		"100.64.0.1": {NodeName: "desktop", LoginName: "alice@github"},
+	}, &calls)
+	a, err := New(Config{NodeName: "n", MaxJobs: 1, WorkDir: t.TempDir(), Auth: auth, Logger: log.New(io.Discard, "", 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := a.Handler()
+	for _, tc := range []struct {
+		name  string
+		local string // "" keeps the real (loopback) local address
+		want  int
+	}{
+		{"arrived on a Tailscale address", "100.64.0.9:7470", http.StatusOK},
+		{"arrived on the LAN", "192.168.1.20:7470", http.StatusForbidden},
+		{"arrived on loopback", "", http.StatusForbidden},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.RemoteAddr = "100.64.0.1:5555" // the forged or genuine source
+			if tc.local != "" {
+				r = r.WithContext(ctxAt(tc.local))
+			}
+			inner.ServeHTTP(w, r)
+		}))
+		resp, err := http.Get(srv.URL + "/v1/jobs")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		srv.Close()
+		if resp.StatusCode != tc.want {
+			t.Errorf("%s: status %d, want %d", tc.name, resp.StatusCode, tc.want)
 		}
 	}
 }
