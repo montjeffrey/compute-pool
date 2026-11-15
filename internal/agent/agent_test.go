@@ -1015,3 +1015,21 @@ func TestDisallowedCallerIsForbidden(t *testing.T) {
 		t.Errorf("err = %v, want ErrForbidden", err)
 	}
 }
+
+func TestRefusalsCloseTheConnection(t *testing.T) {
+	get := func(h *harness) *http.Response {
+		t.Helper()
+		resp, err := http.Get("http://" + net.JoinHostPort(h.host, strconv.Itoa(h.client.Port)) + "/v1/info")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp
+	}
+	if resp := get(newHarness(t, 1, denyAll{})); resp.StatusCode != http.StatusForbidden || !resp.Close {
+		t.Errorf("refused caller: status %d, close %v; want 403 and the connection closed", resp.StatusCode, resp.Close)
+	}
+	if resp := get(newHarness(t, 1, allowAll{})); resp.StatusCode != http.StatusOK || resp.Close {
+		t.Errorf("allowed caller: status %d, close %v; want 200 and the connection kept", resp.StatusCode, resp.Close)
+	}
+}

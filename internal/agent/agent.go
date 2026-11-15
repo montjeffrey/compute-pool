@@ -307,6 +307,9 @@ func fromBrowser(r *http.Request) bool {
 
 func (a *Agent) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A refused caller's connection is closed, so a peer that is not
+		// allowed cannot keep thousands of idle connections open here.
+		w.Header().Set("Connection", "close")
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
 			http.Error(w, "forbidden", http.StatusForbidden)
@@ -339,6 +342,7 @@ func (a *Agent) authenticate(next http.Handler) http.Handler {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
+		w.Header().Del("Connection") // allowed: keep the connection for the next request
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey{}, id)))
 	})
 }
