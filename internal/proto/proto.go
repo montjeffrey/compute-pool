@@ -15,12 +15,18 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/montjeffrey/compute-pool/internal/hwinfo"
 )
 
 // DefaultPort is the TCP port agents listen on.
 const DefaultPort = 7470
+
+// NotTailnetMessage is the body of the 403 an agent sends to a caller whose
+// address is outside the Tailscale ranges. Adding the caller to --allow cannot
+// help it, so the client says something else than for an allowed-list refusal.
+const NotTailnetMessage = "caller is not on a Tailscale address"
 
 // Version is reported by agents and the CLI. Release builds set it from the
 // git tag with -ldflags "-X github.com/montjeffrey/compute-pool/internal/proto.Version=…".
@@ -113,8 +119,16 @@ func windowsReserved(name string) bool {
 	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$":
 		return true
 	}
-	return len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) &&
-		base[3] >= '0' && base[3] <= '9'
+	for _, prefix := range []string{"COM", "LPT"} {
+		// The digit may also be a superscript one, which Windows reserves too.
+		if rest, ok := strings.CutPrefix(base, prefix); ok {
+			r, n := utf8.DecodeRuneInString(rest)
+			if n > 0 && n == len(rest) && (r >= '0' && r <= '9' || r == '¹' || r == '²' || r == '³') {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // FrameType identifies what a Frame carries.

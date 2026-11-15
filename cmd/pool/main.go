@@ -95,6 +95,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if errors.Is(err, flag.ErrHelp) {
 		return 0
 	}
+	var shown flagError
+	if errors.As(err, &shown) {
+		// The flag package has already printed the problem and the usage.
+		if code == 0 {
+			code = 1
+		}
+		return code
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "pool: %v\n", err)
 		if code == 0 {
@@ -104,11 +112,28 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return code
 }
 
+// flagError is a flag-parsing failure that the flag package has already
+// reported, together with the command's usage.
+type flagError struct{ error }
+
+func (e flagError) Unwrap() error { return e.error }
+
+// parseFlags parses args and marks a failure as already reported, so run does
+// not print it (and the usage) a second time. A request for help is returned
+// as is.
+func parseFlags(fs *flag.FlagSet, args []string) error {
+	err := fs.Parse(args)
+	if err != nil && !errors.Is(err, flag.ErrHelp) {
+		return flagError{err}
+	}
+	return err
+}
+
 func cmdNodes(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("nodes", flag.ContinueOnError)
 	port := fs.Int("port", proto.DefaultPort, "agent TCP port")
 	timeout := fs.Duration("timeout", time.Second, "how long to wait for each device")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	st, err := tsutil.GetStatus(ctx)
@@ -195,6 +220,8 @@ func probeAll(ctx context.Context, st tsutil.Status, c *client.Client, timeout t
 
 func probeStatus(err error) string {
 	switch {
+	case errors.Is(err, client.ErrNotTailnet):
+		return "agent only accepts Tailscale addresses, and this connection did not come from one"
 	case errors.Is(err, client.ErrForbidden):
 		return "agent refuses this device (add it to --allow)"
 	case errors.Is(err, client.ErrBusy):
@@ -236,7 +263,7 @@ func pickTargets(ctx context.Context, c *client.Client, timeout time.Duration) (
 	if ranked := client.Rank(cands); len(ranked) > 0 {
 		return ranked, nil
 	}
-	return nil, fmt.Errorf("no device can take the job right now (%s)", explain(results))
+	return nil, fmt.Errorf("no device can take the job right now (%s)%s", explain(results), pausedHint(results))
 }
 
 // explain says, per device, why it cannot take work.
@@ -253,6 +280,18 @@ func explain(results []probeResult) string {
 		why = append(why, r.peer.Name+": "+reason)
 	}
 	return strings.Join(why, "; ")
+}
+
+// pausedHint explains, when an agent is up but has paused itself, what that
+// means and what to do. It is empty when no agent is paused (a device whose
+// job slots are all in use is busy, not paused).
+func pausedHint(results []probeResult) string {
+	for _, r := range results {
+		if r.err == nil && !r.info.Accepting && r.info.Running < r.info.MaxJobs {
+			return ". Agents pause when their device runs low on free memory, is busy with other programs or is on battery; try again shortly, or free memory on the lending devices"
+		}
+	}
+	return ""
 }
 
 type envFlag map[string]string
@@ -287,7 +326,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 		fmt.Fprintln(stderr, "Usage: pool run [--node N] [flags] -- command [args...]")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return 2, err
 	}
 	argv := fs.Args()
@@ -363,9 +402,20 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 		if len(res.Files) > 0 {
 			fmt.Fprintf(stderr, "pool: %d file(s) collected into %s\n", len(res.Files), *outDir)
 		}
-		return res.ExitCode, nil
+		return jobExitCode(res), nil
 	}
 	return 1, errors.New("no device accepted the job")
+}
+
+// jobExitCode is the exit status of pool run: the program's own, except that a
+// job that succeeded but whose results could not be brought back (an unsafe or
+// unmatched --collect pattern, say) fails, so a script does not carry on with
+// files that are missing.
+func jobExitCode(res client.Result) int {
+	if res.ExitCode == 0 && res.RemoteError != "" {
+		return 1
+	}
+	return res.ExitCode
 }
 
 func defaultWorkDir() string {

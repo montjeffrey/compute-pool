@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -203,11 +204,7 @@ func New(cfg Config) (*Agent, error) {
 	}
 	// No job is running yet, so any job folder here was left by an agent
 	// that crashed or was killed.
-	if stale, err := filepath.Glob(filepath.Join(cfg.WorkDir, "job-*")); err == nil {
-		for _, p := range stale {
-			os.RemoveAll(p)
-		}
-	}
+	removeStaleJobDirs(cfg.WorkDir)
 	if cfg.Logger == nil {
 		cfg.Logger = log.New(os.Stderr, "", log.LstdFlags)
 	}
@@ -259,6 +256,25 @@ func (a *Agent) missingFiles(req proto.RunRequest) []string {
 	return missing
 }
 
+// jobDirName matches the folders os.MkdirTemp(workDir, "job-") creates: the
+// prefix and a decimal number. Nothing else in the work directory is ours.
+var jobDirName = regexp.MustCompile(`^job-[0-9]+$`)
+
+// removeStaleJobDirs deletes job folders left in workDir by an agent that
+// crashed or was killed. A folder the user keeps there under a name like
+// "job-tracker" is not touched.
+func removeStaleJobDirs(workDir string) {
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() && jobDirName.MatchString(e.Name()) {
+			os.RemoveAll(filepath.Join(workDir, e.Name()))
+		}
+	}
+}
+
 // Running reports how many jobs are executing.
 func (a *Agent) Running() int { return int(a.running.Load()) }
 
@@ -307,6 +323,9 @@ func fromBrowser(r *http.Request) bool {
 
 func (a *Agent) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A refused caller's connection is closed, so a peer that is not
+		// allowed cannot keep thousands of idle connections open here.
+		w.Header().Set("Connection", "close")
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
 			http.Error(w, "forbidden", http.StatusForbidden)
@@ -332,9 +351,14 @@ func (a *Agent) authenticate(next http.Handler) http.Handler {
 				http.Error(w, "can't confirm who is asking yet; try again shortly", http.StatusServiceUnavailable)
 				return
 			}
+			if errors.Is(err, ErrNotTailnet) {
+				http.Error(w, proto.NotTailnetMessage, http.StatusForbidden)
+				return
+			}
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
+		w.Header().Del("Connection") // allowed: keep the connection for the next request
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey{}, id)))
 	})
 }

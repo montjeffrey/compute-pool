@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"net/netip"
 	"sort"
 	"strings"
@@ -15,6 +17,10 @@ import (
 
 // ErrForbidden marks a caller that was identified but is not allowed.
 var ErrForbidden = errors.New("forbidden")
+
+// ErrNotTailnet marks a caller whose address is outside the Tailscale ranges.
+// It is always returned together with ErrForbidden.
+var ErrNotTailnet = errors.New("not a Tailscale address")
 
 // Identity is the tailnet device behind a request.
 type Identity struct {
@@ -136,7 +142,23 @@ func (a *TailnetAuthorizer) Authorize(ctx context.Context, remoteIP string) (Ide
 	// Anything else is refused before running tailscale, so a scanner on a
 	// LAN (possible with --listen) cannot make the agent spawn processes.
 	if !inTailnetRange(remoteIP) {
-		return Identity{}, fmt.Errorf("%w: %s is not a Tailscale address", ErrForbidden, remoteIP)
+		return Identity{}, fmt.Errorf("%w: %w: %s", ErrForbidden, ErrNotTailnet, remoteIP)
+	}
+	// A packet from a LAN host can carry a forged Tailscale source address.
+	// One that reached this agent through the tunnel was also addressed to a
+	// Tailscale address of this device, so a connection that came in on any
+	// other local address (possible with --listen) is refused. This checks the
+	// Tailscale ranges, not this device's own addresses: that would need the
+	// device's addresses here, kept current as they change. HTTP servers
+	// record the local address in the request context; a context without a
+	// usable one is refused, so a caller that drops it cannot skip the check.
+	la, _ := ctx.Value(http.LocalAddrContextKey).(net.Addr)
+	if la == nil {
+		return Identity{}, fmt.Errorf("%w: %w: no local address for the connection", ErrForbidden, ErrNotTailnet)
+	}
+	ap, err := netip.ParseAddrPort(la.String())
+	if err != nil || !inTailnetRange(ap.Addr().String()) {
+		return Identity{}, fmt.Errorf("%w: %w: connection arrived on %s", ErrForbidden, ErrNotTailnet, la)
 	}
 	who, err := a.whois(ctx, remoteIP)
 	if err != nil {

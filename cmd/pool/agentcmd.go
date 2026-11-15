@@ -61,7 +61,7 @@ func newAgentFlags(name string, stderr io.Writer) (*flag.FlagSet, *agentFlags) {
 
 func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 	fs, f := newAgentFlags("agent", stderr)
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if *f.hideConsole {

@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"net"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -380,5 +382,133 @@ func TestResultPrinterReportsFailures(t *testing.T) {
 	p.add(fanout.Result{Task: fanout.Task{Index: 2, Item: "b"}, Device: "laptop", Outcome: fanout.Outcome{ExitCode: 4}})
 	if !strings.Contains(errb.String(), "task 2 (b) on laptop: exit 4") {
 		t.Errorf("stderr = %q", errb.String())
+	}
+}
+
+func TestDashboardRefusesNonLoopbackWithoutTailnet(t *testing.T) {
+	// requireLoopback is tested directly: cmdDashboard would bind and serve
+	// if the check regressed.
+	for _, addr := range []string{"0.0.0.0:0", ":7471", "192.168.1.5:7471", "100.64.0.1:7471", "[::]:7471", "example.com:7471"} {
+		if err := requireLoopback(addr); err == nil || !strings.Contains(err.Error(), "--tailnet") {
+			t.Errorf("--listen %s: err = %v, want a refusal that mentions --tailnet", addr, err)
+		}
+	}
+	for _, addr := range []string{"127.0.0.1:7471", "localhost:7471", "[::1]:7471", "127.0.0.2:7471"} {
+		if err := requireLoopback(addr); err != nil {
+			t.Errorf("requireLoopback(%s) = %v, want nil", addr, err)
+		}
+	}
+	// What the listener really bound is checked too, whatever the name was.
+	for addr, ok := range map[string]bool{"127.0.0.1:7471": true, "[::1]:7471": true, "192.168.1.5:7471": false, "0.0.0.0:7471": false, "[::]:7471": false} {
+		a := net.Addr(net.TCPAddrFromAddrPort(netip.MustParseAddrPort(addr)))
+		if err := requireLoopbackAddr(a); (err == nil) != ok {
+			t.Errorf("requireLoopbackAddr(%s) = %v, want ok=%v", addr, err, ok)
+		}
+	}
+}
+
+func TestJobExitCode(t *testing.T) {
+	for _, c := range []struct {
+		res  client.Result
+		want int
+	}{
+		{client.Result{}, 0},
+		{client.Result{ExitCode: 3}, 3},
+		{client.Result{RemoteError: "nothing matched *.res"}, 1},
+		{client.Result{ExitCode: 124, RemoteError: "job timed out after 3s"}, 124},
+	} {
+		if got := jobExitCode(c.res); got != c.want {
+			t.Errorf("jobExitCode(%+v) = %d, want %d", c.res, got, c.want)
+		}
+	}
+}
+
+func TestBadFlagPrintsUsageOnce(t *testing.T) {
+	var out, errb bytes.Buffer
+	if code := run([]string{"advise", "--bogus"}, &out, &errb); code != 1 {
+		t.Errorf("exit %d, want 1", code)
+	}
+	got := errb.String()
+	if !strings.Contains(got, "flag provided but not defined: -bogus") {
+		t.Errorf("the flag error is missing: %q", got)
+	}
+	if n := strings.Count(got, "Usage: pool advise"); n != 1 {
+		t.Errorf("usage printed %d times: %q", n, got)
+	}
+	if strings.Contains(got, "pool: flag provided") {
+		t.Errorf("the flag error was repeated: %q", got)
+	}
+	// A help request is not an error.
+	errb.Reset()
+	if code := run([]string{"advise", "-h"}, &out, &errb); code != 0 {
+		t.Errorf("-h exit %d", code)
+	}
+}
+
+func TestPausedHint(t *testing.T) {
+	paused := probeResult{info: proto.Info{Accepting: false, Running: 0, MaxJobs: 4, Reason: "taking no jobs for now: low memory"}}
+	full := probeResult{info: proto.Info{Accepting: false, Running: 4, MaxJobs: 4, Reason: "all 4 job slots in use"}}
+	down := probeResult{err: client.ErrUnreachable}
+	if h := pausedHint([]probeResult{down, paused}); !strings.Contains(h, "low on free memory") {
+		t.Errorf("paused agent: hint = %q", h)
+	}
+	if h := pausedHint([]probeResult{down, full}); h != "" {
+		t.Errorf("full agent: hint = %q, want none", h)
+	}
+}
+
+func TestPartDirsRemovesOnlyItsOwn(t *testing.T) {
+	out := t.TempDir()
+	mine := filepath.Join(out, "01.part-1")
+	foreign := filepath.Join(out, "reports.part-2") // matches the old *.part-* glob, but is not ours
+	for _, d := range []string{mine, foreign} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var p partDirs
+	p.add(mine)
+	p.add(filepath.Join(out, "02.part-3")) // already renamed or removed
+	p.removeAll()
+	if _, err := os.Stat(mine); !os.IsNotExist(err) {
+		t.Error("its own folder was not removed")
+	}
+	if _, err := os.Stat(foreign); err != nil {
+		t.Errorf("a folder it did not create was removed: %v", err)
+	}
+}
+
+func TestPartDirCreateSkipsLeftoverFolders(t *testing.T) {
+	out := t.TempDir()
+	final := filepath.Join(out, "03")
+	// A killed earlier run left this behind.
+	leftover := final + ".part-1"
+	if err := os.MkdirAll(leftover, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(leftover, "stale.txt"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var p partDirs
+	var seq atomic.Int64
+	dir, err := p.create(final, &seq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir == leftover {
+		t.Fatalf("reused the leftover folder %s", dir)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("new folder is not empty: %v", entries)
+	}
+	if _, err := os.Stat(filepath.Join(leftover, "stale.txt")); err != nil {
+		t.Errorf("the leftover was touched: %v", err)
+	}
+	p.removeAll()
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Error("its own folder was not removed")
+	}
+	if _, err := os.Stat(leftover); err != nil {
+		t.Errorf("the leftover was removed: %v", err)
 	}
 }

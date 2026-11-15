@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -37,6 +38,9 @@ func newFileCache(dir string, maxBytes int64) (*fileCache, error) {
 func validHash(h string) bool {
 	if len(h) != 64 {
 		return false
+	}
+	if strings.ToLower(h) != h {
+		return false // on a case-insensitive file system "ABC" would name the entry "abc"
 	}
 	_, err := hex.DecodeString(h)
 	return err == nil
@@ -141,7 +145,7 @@ func (c *fileCache) copyTo(hash, dst string) error {
 		return fmt.Errorf("cached file %s: %w", hash[:12], err)
 	}
 	defer src.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o700)
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o700)
 	if err != nil {
 		return err
 	}

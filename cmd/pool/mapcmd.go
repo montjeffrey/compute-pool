@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"text/tabwriter"
 	"time"
@@ -38,6 +39,51 @@ const maxTasks = 100000
 // maxTaskOutput caps how much of each task's stdout and stderr is held for
 // printing, so a misbehaving agent cannot exhaust the client's memory.
 const maxTaskOutput = 16 << 20
+
+// partDirs remembers the scratch folders one pool map run created for
+// collected files, so cleanup removes exactly those and never matches other
+// folders in --out by name.
+type partDirs struct {
+	mu   sync.Mutex
+	dirs []string
+}
+
+func (p *partDirs) add(dir string) {
+	p.mu.Lock()
+	p.dirs = append(p.dirs, dir)
+	p.mu.Unlock()
+}
+
+// create makes a new, empty scratch folder next to final for one attempt at a
+// task and remembers it. A folder that already exists, such as one a killed
+// run left behind, is never reused (the client would write into it and mix its
+// old files into the results): the next number is tried instead.
+func (p *partDirs) create(final string, seq *atomic.Int64) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(final), 0o700); err != nil {
+		return "", err
+	}
+	for {
+		dir := fmt.Sprintf("%s.part-%d", final, seq.Add(1))
+		err := os.Mkdir(dir, 0o700)
+		if err == nil {
+			p.add(dir)
+			return dir, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return "", err
+		}
+	}
+}
+
+// removeAll deletes every remembered folder that still exists.
+func (p *partDirs) removeAll() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, d := range p.dirs {
+		os.RemoveAll(d)
+	}
+	p.dirs = nil
+}
 
 // cappedBuffer keeps the first maxTaskOutput bytes written and counts the rest.
 type cappedBuffer struct {
@@ -241,7 +287,7 @@ func cmdMap(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 		fmt.Fprintln(stderr, "In the command, {} is replaced by the task's item and {#} by its number.")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return 2, err
 	}
 	argv := fs.Args()
@@ -278,6 +324,7 @@ func cmdMap(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 	width := len(strconv.Itoa(len(tasks)))
 	taskDir := func(idx int) string { return filepath.Join(*outDir, fmt.Sprintf("%0*d", width, idx)) }
 	var attemptSeq atomic.Int64
+	var parts partDirs
 	base := proto.RunRequest{Shell: *shell, TimeoutSec: int(timeout.Seconds()), Collect: collect}
 	for i := range devices {
 		host := devices[i].host
@@ -301,7 +348,11 @@ func cmdMap(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 			if len(collect) > 0 {
 				// Each copy of a task gets its own folder; the winner's is
 				// renamed into place, so backup copies never mix files.
-				out.Dir = fmt.Sprintf("%s.part-%d", taskDir(t.Index), attemptSeq.Add(1))
+				dir, err := parts.create(taskDir(t.Index), &attemptSeq)
+				if err != nil {
+					return fanout.Outcome{RemoteError: err.Error(), ExitCode: 1}, nil
+				}
+				out.Dir = dir
 			}
 			res, err := c.Run(ctx, host, req, out)
 			if err != nil {
@@ -351,10 +402,7 @@ func cmdMap(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 	printer.flush()
 	if len(collect) > 0 {
 		// Copies canceled mid-transfer can leave partial folders behind.
-		leftovers, _ := filepath.Glob(filepath.Join(*outDir, "*.part-*"))
-		for _, p := range leftovers {
-			os.RemoveAll(p)
-		}
+		parts.removeAll()
 	}
 
 	elapsed := time.Since(start)
@@ -498,7 +546,7 @@ func mapDevices(ctx context.Context, c *client.Client, only string, timeout time
 		cands = append(cands, client.Candidate{Name: r.peer.Name, Host: r.peer.IPv4, Info: r.info})
 	}
 	if len(client.Rank(cands)) == 0 {
-		return nil, fmt.Errorf("no device can take tasks right now (%s)", explain(results))
+		return nil, fmt.Errorf("no device can take tasks right now (%s)%s", explain(results), pausedHint(results))
 	}
 	return devs, nil
 }

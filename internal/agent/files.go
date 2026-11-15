@@ -21,12 +21,31 @@ var errCollectTooBig = fmt.Errorf("collected files exceed %d MiB", proto.MaxColl
 // file at path program (see shippedProgram) is linked from the cache instead.
 func writeInputs(dir string, files []proto.InputFile, cache *fileCache, program string) (map[string]string, error) {
 	written := make(map[string]string, len(files))
+	// Two entries for one file would make the second write through the hard
+	// link the first one may have made into the cache.
+	names := make(map[string]bool, len(files))
 	for _, f := range files {
 		rel, err := proto.CleanRelPath(f.Path)
 		if err != nil {
 			return nil, fmt.Errorf("input file: %w", err)
 		}
-		dst := filepath.Join(dir, filepath.FromSlash(rel))
+		key := rel
+		if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+			key = strings.ToLower(rel) // these file systems ignore case
+		}
+		if names[key] {
+			return nil, fmt.Errorf("input file %s: sent more than once", rel)
+		}
+		names[key] = true
+		// CleanRelPath has already refused anything that leaves the job
+		// directory. The path is checked once more in this system's own form,
+		// right where it is joined, so the join never depends on a check made
+		// elsewhere (and static analysis can see that it is contained).
+		local := filepath.FromSlash(rel)
+		if !filepath.IsLocal(local) {
+			return nil, fmt.Errorf("input file: unsafe path %q", f.Path)
+		}
+		dst := filepath.Join(dir, local)
 		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 			return nil, err
 		}
@@ -55,13 +74,27 @@ func writeInputs(dir string, files []proto.InputFile, cache *fileCache, program 
 				}
 			}
 			// Owner-executable so shipped programs and scripts can run.
-			if err := os.WriteFile(dst, f.Data, 0o700); err != nil {
+			if err := writeNew(dst, f.Data); err != nil {
 				return nil, err
 			}
 		}
 		written[rel] = dst
 	}
 	return written, nil
+}
+
+// writeNew creates dst, which must not exist yet, so it can never write
+// through a link into another file.
+func writeNew(dst string, data []byte) error {
+	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o700)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // shippedProgram returns the cleaned path of the shipped file that argv[0]
@@ -92,9 +125,16 @@ func shippedProgram(req proto.RunRequest) string {
 }
 
 // collectOutputs sends every regular file matching patterns back as file
-// frames. Symbolic links and other special files are skipped so a job cannot
-// point the agent at data outside its directory.
+// frames. The job directory is opened as a root, so no path component, not
+// only the last, can lead outside it through a symbolic link or junction.
+// Links and other special files are skipped.
 func collectOutputs(dir string, patterns []string, fw *proto.FrameWriter) error {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	fsys := root.FS()
 	seen := make(map[string]bool)
 	var total int64
 	var unmatched []string
@@ -105,27 +145,28 @@ func collectOutputs(dir string, patterns []string, fw *proto.FrameWriter) error 
 		}
 		// Match within the job directory itself, so glob characters in the
 		// directory's own path can't change what the pattern selects.
-		matches, err := fs.Glob(os.DirFS(dir), rel)
+		matches, err := fs.Glob(fsys, rel)
 		if err != nil {
 			return fmt.Errorf("pattern %q: %w", pat, err)
 		}
-		if len(matches) == 0 {
-			unmatched = append(unmatched, pat)
-		}
+		usable, links := 0, 0
 		for _, m := range matches {
-			full := filepath.Join(dir, filepath.FromSlash(m))
-			err := filepath.WalkDir(full, func(p string, d fs.DirEntry, err error) error {
+			fi, err := root.Lstat(m)
+			if err != nil || !fi.Mode().IsRegular() && !fi.IsDir() {
+				if err == nil && fi.Mode()&fs.ModeSymlink != 0 {
+					links++
+				}
+				continue // links and devices are skipped
+			}
+			usable++
+			err = fs.WalkDir(fsys, m, func(p string, d fs.DirEntry, err error) error {
 				if err != nil {
 					return err
 				}
 				if !d.Type().IsRegular() {
 					return nil // directories are walked; links and devices are skipped
 				}
-				r, err := filepath.Rel(dir, p)
-				if err != nil {
-					return nil
-				}
-				slash, err := proto.CleanRelPath(filepath.ToSlash(r))
+				slash, err := proto.CleanRelPath(p)
 				if err != nil || seen[slash] {
 					return nil
 				}
@@ -137,11 +178,18 @@ func collectOutputs(dir string, patterns []string, fw *proto.FrameWriter) error 
 				if total += info.Size(); total > proto.MaxCollectBytes {
 					return errCollectTooBig
 				}
-				return sendFile(p, slash, fw)
+				return sendFile(root, p, slash, fw)
 			})
 			if err != nil {
 				return err
 			}
+		}
+		switch {
+		case usable > 0:
+		case links > 0:
+			unmatched = append(unmatched, pat+" (it names only links; links are not collected)")
+		default:
+			unmatched = append(unmatched, pat)
 		}
 	}
 	if len(unmatched) > 0 {
@@ -150,8 +198,8 @@ func collectOutputs(dir string, patterns []string, fw *proto.FrameWriter) error 
 	return nil
 }
 
-func sendFile(src, rel string, fw *proto.FrameWriter) error {
-	f, err := os.Open(src)
+func sendFile(root *os.Root, name, rel string, fw *proto.FrameWriter) error {
+	f, err := root.Open(name)
 	if err != nil {
 		return err
 	}

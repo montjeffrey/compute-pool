@@ -100,7 +100,7 @@ func TestCleanRelPath(t *testing.T) {
 		}
 	}
 	for _, bad := range []string{"", ".", "..", "../x", "a/../../x", "/abs", `\abs`, "C:x", `C:\x`, "file.txt:stream",
-		"CON", "nul.txt", "out/aux", "COM1", "lpt9.log", "conin$", "trailing.", "trailing ", "dir./x",
+		"CON", "COM¹", "com².txt", "LPT³", "nul.txt", "out/aux", "COM1", "lpt9.log", "conin$", "trailing.", "trailing ", "dir./x",
 		"tab\there", "nul\x00byte", "a|b", "a<b", `a"b`} {
 		if got, err := CleanRelPath(bad); err == nil {
 			t.Errorf("CleanRelPath(%q) = %q, want error", bad, got)

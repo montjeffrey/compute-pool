@@ -23,6 +23,11 @@ import (
 // ErrForbidden means the agent refused this device.
 var ErrForbidden = errors.New("this device is not allowed by the agent")
 
+// ErrNotTailnet is wrapped together with ErrForbidden when the agent refused
+// the connection because it did not come from a Tailscale address, which no
+// allow list can fix.
+var ErrNotTailnet = errors.New("the connection did not come from a Tailscale address")
+
 // ErrUnreachable means no connection was made to the agent, so nothing ran
 // and the job can safely go elsewhere.
 var ErrUnreachable = errors.New("agent unreachable")
@@ -95,10 +100,25 @@ func (c *Client) Jobs(ctx context.Context, host string) (proto.Jobs, error) {
 		return proto.Jobs{}, err
 	}
 	var jobs proto.Jobs
-	if err := json.NewDecoder(resp.Body).Decode(&jobs); err != nil {
+	if err := decodeStatus(resp.Body, &jobs); err != nil {
 		return proto.Jobs{}, fmt.Errorf("decode jobs: %w", err)
 	}
 	return jobs, nil
+}
+
+// maxStatusBytes bounds an agent's answer to /v1/info and /v1/jobs, so a
+// misbehaving agent cannot make a client buffer an endless reply. Real ones
+// are a few kilobytes.
+const maxStatusBytes = 4 << 20
+
+// decodeStatus decodes one JSON value of at most maxStatusBytes from r.
+func decodeStatus(r io.Reader, v any) error {
+	lr := &io.LimitedReader{R: r, N: maxStatusBytes}
+	err := json.NewDecoder(lr).Decode(v)
+	if err != nil && lr.N <= 0 {
+		return fmt.Errorf("the reply is larger than the %d MiB limit", maxStatusBytes>>20)
+	}
+	return err
 }
 
 // ErrNoLog means the agent doesn't serve its log: it is older than this
@@ -168,7 +188,7 @@ func (c *Client) Info(ctx context.Context, host string) (proto.Info, error) {
 		return proto.Info{}, err
 	}
 	var info proto.Info
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+	if err := decodeStatus(resp.Body, &info); err != nil {
 		return proto.Info{}, fmt.Errorf("decode info: %w", err)
 	}
 	return info, nil
@@ -341,6 +361,10 @@ func checkStatus(resp *http.Response) error {
 	case http.StatusOK:
 		return nil
 	case http.StatusForbidden:
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if strings.TrimSpace(string(msg)) == proto.NotTailnetMessage {
+			return fmt.Errorf("%w: %w", ErrForbidden, ErrNotTailnet)
+		}
 		return ErrForbidden
 	}
 	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))

@@ -93,6 +93,7 @@ func TestProbeStatus(t *testing.T) {
 		want string
 	}{
 		{client.ErrForbidden, "agent refuses this device (add it to --allow)"},
+		{fmt.Errorf("%w: %w", client.ErrForbidden, client.ErrNotTailnet), "agent only accepts Tailscale addresses, and this connection did not come from one"},
 		{busy, "agent busy: can't confirm who is asking yet; try again shortly"},
 		{errors.New("connection refused"), "no agent"},
 	} {

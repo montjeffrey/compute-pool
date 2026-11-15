@@ -990,9 +990,46 @@ func TestUnconfirmedCallerIsBusyNotForbidden(t *testing.T) {
 	}
 }
 
+type notTailnet struct{}
+
+func (notTailnet) Authorize(context.Context, string) (agent.Identity, error) {
+	return agent.Identity{}, fmt.Errorf("%w: %w", agent.ErrForbidden, agent.ErrNotTailnet)
+}
+
+func TestCallerOutsideTailnetGetsAccurateRefusal(t *testing.T) {
+	h := newHarness(t, 1, notTailnet{})
+	_, err := h.client.Info(context.Background(), h.host)
+	if !errors.Is(err, client.ErrNotTailnet) || !errors.Is(err, client.ErrForbidden) {
+		t.Errorf("err = %v, want ErrNotTailnet and ErrForbidden", err)
+	}
+	// An allow-list refusal stays a plain one.
+	h = newHarness(t, 1, denyAll{})
+	if _, err := h.client.Info(context.Background(), h.host); errors.Is(err, client.ErrNotTailnet) {
+		t.Errorf("allow-list refusal reported as not-tailnet: %v", err)
+	}
+}
+
 func TestDisallowedCallerIsForbidden(t *testing.T) {
 	h := newHarness(t, 1, denyAll{})
 	if _, err := h.client.Info(context.Background(), h.host); !errors.Is(err, client.ErrForbidden) {
 		t.Errorf("err = %v, want ErrForbidden", err)
+	}
+}
+
+func TestRefusalsCloseTheConnection(t *testing.T) {
+	get := func(h *harness) *http.Response {
+		t.Helper()
+		resp, err := http.Get("http://" + net.JoinHostPort(h.host, strconv.Itoa(h.client.Port)) + "/v1/info")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp
+	}
+	if resp := get(newHarness(t, 1, denyAll{})); resp.StatusCode != http.StatusForbidden || !resp.Close {
+		t.Errorf("refused caller: status %d, close %v; want 403 and the connection closed", resp.StatusCode, resp.Close)
+	}
+	if resp := get(newHarness(t, 1, allowAll{})); resp.StatusCode != http.StatusOK || resp.Close {
+		t.Errorf("allowed caller: status %d, close %v; want 200 and the connection kept", resp.StatusCode, resp.Close)
 	}
 }
