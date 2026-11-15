@@ -100,11 +100,16 @@ func (c *Client) Jobs(ctx context.Context, host string) (proto.Jobs, error) {
 		return proto.Jobs{}, err
 	}
 	var jobs proto.Jobs
-	if err := json.NewDecoder(resp.Body).Decode(&jobs); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxStatusBytes)).Decode(&jobs); err != nil {
 		return proto.Jobs{}, fmt.Errorf("decode jobs: %w", err)
 	}
 	return jobs, nil
 }
+
+// maxStatusBytes bounds an agent's answer to /v1/info and /v1/jobs, so a
+// misbehaving agent cannot make a client buffer an endless reply. Real ones
+// are a few kilobytes.
+const maxStatusBytes = 4 << 20
 
 // ErrNoLog means the agent doesn't serve its log: it is older than this
 // client, or it logs to the console instead of a file.
@@ -173,7 +178,7 @@ func (c *Client) Info(ctx context.Context, host string) (proto.Info, error) {
 		return proto.Info{}, err
 	}
 	var info proto.Info
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxStatusBytes)).Decode(&info); err != nil {
 		return proto.Info{}, fmt.Errorf("decode info: %w", err)
 	}
 	return info, nil
