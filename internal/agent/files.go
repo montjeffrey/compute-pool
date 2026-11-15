@@ -141,14 +141,17 @@ func collectOutputs(dir string, patterns []string, fw *proto.FrameWriter) error 
 		if err != nil {
 			return fmt.Errorf("pattern %q: %w", pat, err)
 		}
-		if len(matches) == 0 {
-			unmatched = append(unmatched, pat)
-		}
+		usable, links := 0, 0
 		for _, m := range matches {
-			if fi, err := root.Lstat(m); err != nil || !fi.Mode().IsRegular() && !fi.IsDir() {
+			fi, err := root.Lstat(m)
+			if err != nil || !fi.Mode().IsRegular() && !fi.IsDir() {
+				if err == nil && fi.Mode()&fs.ModeSymlink != 0 {
+					links++
+				}
 				continue // links and devices are skipped
 			}
-			err := fs.WalkDir(fsys, m, func(p string, d fs.DirEntry, err error) error {
+			usable++
+			err = fs.WalkDir(fsys, m, func(p string, d fs.DirEntry, err error) error {
 				if err != nil {
 					return err
 				}
@@ -172,6 +175,13 @@ func collectOutputs(dir string, patterns []string, fw *proto.FrameWriter) error 
 			if err != nil {
 				return err
 			}
+		}
+		switch {
+		case usable > 0:
+		case links > 0:
+			unmatched = append(unmatched, pat+" (it names only links; links are not collected)")
+		default:
+			unmatched = append(unmatched, pat)
 		}
 	}
 	if len(unmatched) > 0 {

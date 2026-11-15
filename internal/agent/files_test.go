@@ -120,3 +120,26 @@ func TestStaleCleanupOnlyRemovesJobFolders(t *testing.T) {
 		}
 	}
 }
+
+func TestCollectReportsAPatternThatMatchesOnlyALink(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "real.txt"), []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real.txt", filepath.Join(dir, "link.txt")); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	var buf bytes.Buffer
+	err := collectOutputs(dir, []string{"link.txt"}, proto.NewFrameWriter(&buf, nil))
+	if err == nil || !strings.Contains(err.Error(), "links are not collected") {
+		t.Errorf("err = %v, want a note that links are not collected", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("a link was sent: %s", buf.String())
+	}
+	// A pattern that matches a link and a real file is satisfied by the file.
+	buf.Reset()
+	if err := collectOutputs(dir, []string{"*.txt"}, proto.NewFrameWriter(&buf, nil)); err != nil {
+		t.Errorf("*.txt: %v", err)
+	}
+}
