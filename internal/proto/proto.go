@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/montjeffrey/compute-pool/internal/hwinfo"
 )
@@ -113,8 +114,16 @@ func windowsReserved(name string) bool {
 	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$":
 		return true
 	}
-	return len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) &&
-		base[3] >= '0' && base[3] <= '9'
+	for _, prefix := range []string{"COM", "LPT"} {
+		// The digit may also be a superscript one, which Windows reserves too.
+		if rest, ok := strings.CutPrefix(base, prefix); ok {
+			r, n := utf8.DecodeRuneInString(rest)
+			if n > 0 && n == len(rest) && (r >= '0' && r <= '9' || r == '¹' || r == '²' || r == '³') {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // FrameType identifies what a Frame carries.
