@@ -3,6 +3,9 @@ package agent
 import (
 	"context"
 	"errors"
+	"net"
+	"net/http"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -251,5 +254,29 @@ func TestRemovedDeviceLosesAccessWithinTTL(t *testing.T) {
 	clock.t = t0.Add(61 * time.Second)
 	if _, err := a.Authorize(context.Background(), "100.64.0.1"); err == nil {
 		t.Fatal("removed device still allowed after the TTL")
+	}
+}
+
+func TestConnectionMustArriveOnATailnetAddress(t *testing.T) {
+	var calls int
+	a := fakeAuthorizer(map[string]tsutil.WhoIs{
+		"100.64.0.1": {NodeName: "desktop", LoginName: "alice@github"},
+	}, &calls)
+	at := func(local string) context.Context {
+		return context.WithValue(context.Background(), http.LocalAddrContextKey, net.Addr(net.TCPAddrFromAddrPort(netip.MustParseAddrPort(local))))
+	}
+	// A forged Tailscale source address on a LAN connection is refused before any lookup.
+	for _, local := range []string{"192.168.1.20:7470", "127.0.0.1:7470", "[::1]:7470"} {
+		if _, err := a.Authorize(at(local), "100.64.0.1"); !errors.Is(err, ErrForbidden) || !errors.Is(err, ErrNotTailnet) {
+			t.Errorf("connection on %s: err = %v, want forbidden and not-tailnet", local, err)
+		}
+	}
+	if calls != 0 {
+		t.Errorf("whois ran %d times for connections on a non-Tailscale address", calls)
+	}
+	for _, local := range []string{"100.64.0.9:7470", "[fd7a:115c:a1e0::9]:7470"} {
+		if _, err := a.Authorize(at(local), "100.64.0.1"); err != nil {
+			t.Errorf("connection on %s: %v", local, err)
+		}
 	}
 }
