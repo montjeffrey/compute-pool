@@ -447,3 +447,24 @@ func TestPausedHint(t *testing.T) {
 		t.Errorf("full agent: hint = %q, want none", h)
 	}
 }
+
+func TestPartDirsRemovesOnlyItsOwn(t *testing.T) {
+	out := t.TempDir()
+	mine := filepath.Join(out, "01.part-1")
+	foreign := filepath.Join(out, "reports.part-2") // matches the old *.part-* glob, but is not ours
+	for _, d := range []string{mine, foreign} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var p partDirs
+	p.add(mine)
+	p.add(filepath.Join(out, "02.part-3")) // already renamed or removed
+	p.removeAll()
+	if _, err := os.Stat(mine); !os.IsNotExist(err) {
+		t.Error("its own folder was not removed")
+	}
+	if _, err := os.Stat(foreign); err != nil {
+		t.Errorf("a folder it did not create was removed: %v", err)
+	}
+}

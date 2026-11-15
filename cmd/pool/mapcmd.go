@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"text/tabwriter"
 	"time"
@@ -38,6 +39,30 @@ const maxTasks = 100000
 // maxTaskOutput caps how much of each task's stdout and stderr is held for
 // printing, so a misbehaving agent cannot exhaust the client's memory.
 const maxTaskOutput = 16 << 20
+
+// partDirs remembers the scratch folders one pool map run created for
+// collected files, so cleanup removes exactly those and never matches other
+// folders in --out by name.
+type partDirs struct {
+	mu   sync.Mutex
+	dirs []string
+}
+
+func (p *partDirs) add(dir string) {
+	p.mu.Lock()
+	p.dirs = append(p.dirs, dir)
+	p.mu.Unlock()
+}
+
+// removeAll deletes every remembered folder that still exists.
+func (p *partDirs) removeAll() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, d := range p.dirs {
+		os.RemoveAll(d)
+	}
+	p.dirs = nil
+}
 
 // cappedBuffer keeps the first maxTaskOutput bytes written and counts the rest.
 type cappedBuffer struct {
@@ -278,6 +303,7 @@ func cmdMap(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 	width := len(strconv.Itoa(len(tasks)))
 	taskDir := func(idx int) string { return filepath.Join(*outDir, fmt.Sprintf("%0*d", width, idx)) }
 	var attemptSeq atomic.Int64
+	var parts partDirs
 	base := proto.RunRequest{Shell: *shell, TimeoutSec: int(timeout.Seconds()), Collect: collect}
 	for i := range devices {
 		host := devices[i].host
@@ -302,6 +328,7 @@ func cmdMap(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 				// Each copy of a task gets its own folder; the winner's is
 				// renamed into place, so backup copies never mix files.
 				out.Dir = fmt.Sprintf("%s.part-%d", taskDir(t.Index), attemptSeq.Add(1))
+				parts.add(out.Dir)
 			}
 			res, err := c.Run(ctx, host, req, out)
 			if err != nil {
@@ -351,10 +378,7 @@ func cmdMap(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 	printer.flush()
 	if len(collect) > 0 {
 		// Copies canceled mid-transfer can leave partial folders behind.
-		leftovers, _ := filepath.Glob(filepath.Join(*outDir, "*.part-*"))
-		for _, p := range leftovers {
-			os.RemoveAll(p)
-		}
+		parts.removeAll()
 	}
 
 	elapsed := time.Since(start)
