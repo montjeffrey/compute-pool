@@ -54,6 +54,27 @@ func (p *partDirs) add(dir string) {
 	p.mu.Unlock()
 }
 
+// create makes a new, empty scratch folder next to final for one attempt at a
+// task and remembers it. A folder that already exists, such as one a killed
+// run left behind, is never reused (the client would write into it and mix its
+// old files into the results): the next number is tried instead.
+func (p *partDirs) create(final string, seq *atomic.Int64) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(final), 0o700); err != nil {
+		return "", err
+	}
+	for {
+		dir := fmt.Sprintf("%s.part-%d", final, seq.Add(1))
+		err := os.Mkdir(dir, 0o700)
+		if err == nil {
+			p.add(dir)
+			return dir, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return "", err
+		}
+	}
+}
+
 // removeAll deletes every remembered folder that still exists.
 func (p *partDirs) removeAll() {
 	p.mu.Lock()
@@ -327,8 +348,11 @@ func cmdMap(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 			if len(collect) > 0 {
 				// Each copy of a task gets its own folder; the winner's is
 				// renamed into place, so backup copies never mix files.
-				out.Dir = fmt.Sprintf("%s.part-%d", taskDir(t.Index), attemptSeq.Add(1))
-				parts.add(out.Dir)
+				dir, err := parts.create(taskDir(t.Index), &attemptSeq)
+				if err != nil {
+					return fanout.Outcome{RemoteError: err.Error(), ExitCode: 1}, nil
+				}
+				out.Dir = dir
 			}
 			res, err := c.Run(ctx, host, req, out)
 			if err != nil {

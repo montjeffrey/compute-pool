@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -466,5 +467,40 @@ func TestPartDirsRemovesOnlyItsOwn(t *testing.T) {
 	}
 	if _, err := os.Stat(foreign); err != nil {
 		t.Errorf("a folder it did not create was removed: %v", err)
+	}
+}
+
+func TestPartDirCreateSkipsLeftoverFolders(t *testing.T) {
+	out := t.TempDir()
+	final := filepath.Join(out, "03")
+	// A killed earlier run left this behind.
+	leftover := final + ".part-1"
+	if err := os.MkdirAll(leftover, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(leftover, "stale.txt"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var p partDirs
+	var seq atomic.Int64
+	dir, err := p.create(final, &seq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir == leftover {
+		t.Fatalf("reused the leftover folder %s", dir)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("new folder is not empty: %v", entries)
+	}
+	if _, err := os.Stat(filepath.Join(leftover, "stale.txt")); err != nil {
+		t.Errorf("the leftover was touched: %v", err)
+	}
+	p.removeAll()
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Error("its own folder was not removed")
+	}
+	if _, err := os.Stat(leftover); err != nil {
+		t.Errorf("the leftover was removed: %v", err)
 	}
 }
