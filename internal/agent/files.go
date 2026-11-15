@@ -37,7 +37,15 @@ func writeInputs(dir string, files []proto.InputFile, cache *fileCache, program 
 			return nil, fmt.Errorf("input file %s: sent more than once", rel)
 		}
 		names[key] = true
-		dst := filepath.Join(dir, filepath.FromSlash(rel))
+		// CleanRelPath has already refused anything that leaves the job
+		// directory. The path is checked once more in this system's own form,
+		// right where it is joined, so the join never depends on a check made
+		// elsewhere (and static analysis can see that it is contained).
+		local := filepath.FromSlash(rel)
+		if !filepath.IsLocal(local) {
+			return nil, fmt.Errorf("input file: unsafe path %q", f.Path)
+		}
+		dst := filepath.Join(dir, local)
 		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 			return nil, err
 		}

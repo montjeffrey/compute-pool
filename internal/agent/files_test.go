@@ -184,3 +184,36 @@ func TestInputWritersNeverOverwriteAnExistingFile(t *testing.T) {
 	_, err = writeInputs(dir, []proto.InputFile{{Path: "c.txt", Data: []byte("POISON")}}, cache, "")
 	check("writeInputs", p, err)
 }
+
+// writeInputs checks every path a second time with filepath.IsLocal before it
+// joins it to the job directory. That check must never refuse a name that
+// CleanRelPath accepts.
+func TestWriteInputsAcceptsEveryCleanPath(t *testing.T) {
+	dir := t.TempDir()
+	names := []string{"a.txt", "dir/b.txt", `dir\win\c.txt`, "./x/../y.txt", "console.log", "com10.txt", ".hidden", "a b/c d.txt", "x..y/z"}
+	var files []proto.InputFile
+	for _, n := range names {
+		files = append(files, proto.InputFile{Path: n, Data: []byte(n)})
+	}
+	written, err := writeInputs(dir, files, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range names {
+		rel, err := proto.CleanRelPath(n)
+		if err != nil {
+			t.Fatalf("CleanRelPath(%q): %v", n, err)
+		}
+		p, ok := written[rel]
+		if !ok {
+			t.Errorf("%q was not written", n)
+			continue
+		}
+		if got, err := os.ReadFile(p); err != nil || string(got) != n {
+			t.Errorf("%q: read %q, %v", n, got, err)
+		}
+		if under, err := filepath.Rel(dir, p); err != nil || !filepath.IsLocal(under) {
+			t.Errorf("%q was written outside the job directory: %s", n, p)
+		}
+	}
+}
