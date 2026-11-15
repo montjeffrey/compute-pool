@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -190,6 +191,23 @@ func requireDevice(auth agent.Authorizer, next http.Handler) http.Handler {
 	})
 }
 
+// requireLoopback refuses a listen address that is reachable from other
+// machines. Without --tailnet the dashboard has no device check, so it may only
+// serve this machine.
+func requireLoopback(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("--listen: %w", err)
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	if ip, err := netip.ParseAddr(host); err == nil && ip.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("--listen %s is not a loopback address and the dashboard would be open to anyone who can reach it; add --tailnet to serve it to your own devices, or listen on 127.0.0.1", addr)
+}
+
 func cmdDashboard(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("dashboard", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -235,6 +253,11 @@ func cmdDashboard(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	d := &dashboard{gather: gather, ttl: time.Second}
 
 	addr := *listen
+	if !*tailnet {
+		if err := requireLoopback(addr); err != nil {
+			return err
+		}
+	}
 	h := d.handler()
 	var self tsutil.Peer
 	if *tailnet {
