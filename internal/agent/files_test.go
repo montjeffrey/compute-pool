@@ -71,3 +71,26 @@ func TestWriteInputsRejectsDuplicatePaths(t *testing.T) {
 		t.Errorf("cache entry = %q, %v; want it unchanged", got, err)
 	}
 }
+
+func TestCacheRequiresLowercaseHashes(t *testing.T) {
+	cache, err := newFileCache(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("x")
+	sum := sha256.Sum256(data)
+	hash := hex.EncodeToString(sum[:])
+	if err := cache.put(hash, data); err != nil {
+		t.Fatal(err)
+	}
+	upper := strings.ToUpper(hash)
+	if validHash(upper) || cache.has(upper) || cache.verify(upper) {
+		t.Error("an uppercase hash was accepted")
+	}
+	if err := cache.put(upper, data); err == nil {
+		t.Error("put accepted an uppercase hash")
+	}
+	if !cache.has(hash) {
+		t.Error("the lowercase entry was lost")
+	}
+}

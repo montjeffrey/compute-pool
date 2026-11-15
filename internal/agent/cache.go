@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -37,6 +38,9 @@ func newFileCache(dir string, maxBytes int64) (*fileCache, error) {
 func validHash(h string) bool {
 	if len(h) != 64 {
 		return false
+	}
+	if strings.ToLower(h) != h {
+		return false // on a case-insensitive file system "ABC" would name the entry "abc"
 	}
 	_, err := hex.DecodeString(h)
 	return err == nil
