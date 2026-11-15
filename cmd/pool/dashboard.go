@@ -218,7 +218,7 @@ func cmdDashboard(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	allow := fs.String("allow", "", "with --tailnet, devices allowed to view it (this device always can)")
 	open := fs.Bool("open", false, "open the dashboard in a browser")
 	port := fs.Int("port", proto.DefaultPort, "agent TCP port")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 

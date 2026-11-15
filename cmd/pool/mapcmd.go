@@ -241,7 +241,7 @@ func cmdMap(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 		fmt.Fprintln(stderr, "In the command, {} is replaced by the task's item and {#} by its number.")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return 2, err
 	}
 	argv := fs.Args()

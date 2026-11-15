@@ -413,3 +413,25 @@ func TestJobExitCode(t *testing.T) {
 		}
 	}
 }
+
+func TestBadFlagPrintsUsageOnce(t *testing.T) {
+	var out, errb bytes.Buffer
+	if code := run([]string{"advise", "--bogus"}, &out, &errb); code != 1 {
+		t.Errorf("exit %d, want 1", code)
+	}
+	got := errb.String()
+	if !strings.Contains(got, "flag provided but not defined: -bogus") {
+		t.Errorf("the flag error is missing: %q", got)
+	}
+	if n := strings.Count(got, "Usage: pool advise"); n != 1 {
+		t.Errorf("usage printed %d times: %q", n, got)
+	}
+	if strings.Contains(got, "pool: flag provided") {
+		t.Errorf("the flag error was repeated: %q", got)
+	}
+	// A help request is not an error.
+	errb.Reset()
+	if code := run([]string{"advise", "-h"}, &out, &errb); code != 0 {
+		t.Errorf("-h exit %d", code)
+	}
+}

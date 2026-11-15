@@ -65,7 +65,7 @@ func cmdSetup(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 		fmt.Fprintln(stderr, "Describes this device, measures its speed, recommends agent settings and, once you confirm, installs the agent with them.")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {

@@ -29,7 +29,7 @@ func cmdAdvise(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		fmt.Fprintln(stderr, "Compares every device in the pool: what each contributes, how much faster the pool is than this device alone, and what to change.")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {

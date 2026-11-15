@@ -95,6 +95,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if errors.Is(err, flag.ErrHelp) {
 		return 0
 	}
+	var shown flagError
+	if errors.As(err, &shown) {
+		// The flag package has already printed the problem and the usage.
+		if code == 0 {
+			code = 1
+		}
+		return code
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "pool: %v\n", err)
 		if code == 0 {
@@ -104,11 +112,28 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return code
 }
 
+// flagError is a flag-parsing failure that the flag package has already
+// reported, together with the command's usage.
+type flagError struct{ error }
+
+func (e flagError) Unwrap() error { return e.error }
+
+// parseFlags parses args and marks a failure as already reported, so run does
+// not print it (and the usage) a second time. A request for help is returned
+// as is.
+func parseFlags(fs *flag.FlagSet, args []string) error {
+	err := fs.Parse(args)
+	if err != nil && !errors.Is(err, flag.ErrHelp) {
+		return flagError{err}
+	}
+	return err
+}
+
 func cmdNodes(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("nodes", flag.ContinueOnError)
 	port := fs.Int("port", proto.DefaultPort, "agent TCP port")
 	timeout := fs.Duration("timeout", time.Second, "how long to wait for each device")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	st, err := tsutil.GetStatus(ctx)
@@ -289,7 +314,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 		fmt.Fprintln(stderr, "Usage: pool run [--node N] [flags] -- command [args...]")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return 2, err
 	}
 	argv := fs.Args()

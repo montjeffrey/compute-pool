@@ -47,7 +47,7 @@ func cmdReport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		fmt.Fprintln(stderr, "measurement), consistency between runs, slot use, and reliability.")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
