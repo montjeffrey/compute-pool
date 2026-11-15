@@ -210,6 +210,16 @@ func requireLoopback(addr string) error {
 	return fmt.Errorf("--listen %s is not a loopback address and the dashboard would be open to anyone who can reach it; add --tailnet to serve it to your own devices, or listen on 127.0.0.1", addr)
 }
 
+// requireLoopbackAddr checks the address a listener actually bound, which a
+// name such as localhost may not have resolved to loopback.
+func requireLoopbackAddr(a net.Addr) error {
+	ap, err := netip.ParseAddrPort(a.String())
+	if err != nil || !ap.Addr().IsLoopback() {
+		return fmt.Errorf("the dashboard bound %s, which is not a loopback address; add --tailnet to serve it to your own devices, or listen on 127.0.0.1", a)
+	}
+	return nil
+}
+
 func cmdDashboard(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("dashboard", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -279,6 +289,12 @@ func cmdDashboard(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
+	}
+	if !*tailnet {
+		if err := requireLoopbackAddr(ln.Addr()); err != nil {
+			ln.Close()
+			return err
+		}
 	}
 	// Either way, only Host headers naming this server are answered, which
 	// blocks DNS rebinding from a web page.

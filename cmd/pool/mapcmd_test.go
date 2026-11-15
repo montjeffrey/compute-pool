@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -385,16 +386,23 @@ func TestResultPrinterReportsFailures(t *testing.T) {
 }
 
 func TestDashboardRefusesNonLoopbackWithoutTailnet(t *testing.T) {
+	// requireLoopback is tested directly: cmdDashboard would bind and serve
+	// if the check regressed.
 	for _, addr := range []string{"0.0.0.0:0", ":7471", "192.168.1.5:7471", "100.64.0.1:7471", "[::]:7471", "example.com:7471"} {
-		var out, errb bytes.Buffer
-		err := cmdDashboard(context.Background(), []string{"--listen", addr}, &out, &errb)
-		if err == nil || !strings.Contains(err.Error(), "--tailnet") {
+		if err := requireLoopback(addr); err == nil || !strings.Contains(err.Error(), "--tailnet") {
 			t.Errorf("--listen %s: err = %v, want a refusal that mentions --tailnet", addr, err)
 		}
 	}
 	for _, addr := range []string{"127.0.0.1:7471", "localhost:7471", "[::1]:7471", "127.0.0.2:7471"} {
 		if err := requireLoopback(addr); err != nil {
 			t.Errorf("requireLoopback(%s) = %v, want nil", addr, err)
+		}
+	}
+	// What the listener really bound is checked too, whatever the name was.
+	for addr, ok := range map[string]bool{"127.0.0.1:7471": true, "[::1]:7471": true, "192.168.1.5:7471": false, "0.0.0.0:7471": false, "[::]:7471": false} {
+		a := net.Addr(net.TCPAddrFromAddrPort(netip.MustParseAddrPort(addr)))
+		if err := requireLoopbackAddr(a); (err == nil) != ok {
+			t.Errorf("requireLoopbackAddr(%s) = %v, want ok=%v", addr, err, ok)
 		}
 	}
 }
