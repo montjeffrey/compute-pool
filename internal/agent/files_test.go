@@ -95,6 +95,54 @@ func TestCacheRequiresLowercaseHashes(t *testing.T) {
 	}
 }
 
+// Every cache operation turns a hash into a file name in one place, and that
+// place must refuse anything that is not a hash, whatever the caller checked.
+func TestCachePathRefusesAnythingButAHash(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := newFileCache(dir, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := strings.Repeat("ab", 32)
+	got, err := cache.path(good)
+	if err != nil || got != filepath.Join(dir, good) {
+		t.Fatalf("path(%q) = %q, %v; want the entry inside the cache directory", good, got, err)
+	}
+	outside := filepath.Join(t.TempDir(), "out")
+	for _, bad := range []string{
+		"",
+		".",
+		"..",
+		"../" + strings.Repeat("a", 61),
+		`..\` + strings.Repeat("a", 61),
+		strings.Repeat("a", 32) + "/" + strings.Repeat("a", 31),
+		strings.Repeat("a", 63),
+		strings.Repeat("a", 65),
+		strings.Repeat("g", 64),
+		strings.Repeat("A", 64),
+		filepath.Join(dir, good),
+	} {
+		if p, err := cache.path(bad); err == nil {
+			t.Errorf("path(%q) = %q, want an error", bad, p)
+		}
+		if cache.has(bad) || cache.verify(bad) {
+			t.Errorf("has or verify accepted %q", bad)
+		}
+		if err := cache.put(bad, nil); err == nil {
+			t.Errorf("put accepted %q", bad)
+		}
+		if err := cache.linkTo(bad, outside); err == nil {
+			t.Errorf("linkTo accepted %q", bad)
+		}
+		if err := cache.copyTo(bad, outside); err == nil {
+			t.Errorf("copyTo accepted %q", bad)
+		}
+	}
+	if _, err := os.Lstat(outside); err == nil {
+		t.Error("a refused hash still created a file")
+	}
+}
+
 func TestStaleCleanupOnlyRemovesJobFolders(t *testing.T) {
 	work := t.TempDir()
 	for _, d := range []string{"job-123456", "job-7", "job-tracker", "job-", "jobs", "notes"} {
