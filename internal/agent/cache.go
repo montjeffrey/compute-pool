@@ -46,20 +46,35 @@ func validHash(h string) bool {
 	return err == nil
 }
 
-func (c *fileCache) path(hash string) string { return filepath.Join(c.dir, hash) }
+// path returns where the entry for hash is kept. It is the only place a hash
+// becomes a file name, so the check is made here and no caller can skip it.
+// A valid hash is 64 hex digits and can never leave the cache directory; the
+// name is checked with filepath.IsLocal as well, right where it is joined, so
+// that static analysis can see it is contained.
+func (c *fileCache) path(hash string) (string, error) {
+	if !validHash(hash) {
+		return "", fmt.Errorf("invalid sha256 %q", hash)
+	}
+	if !filepath.IsLocal(hash) {
+		return "", fmt.Errorf("invalid sha256 %q", hash)
+	}
+	return filepath.Join(c.dir, hash), nil
+}
 
 func (c *fileCache) has(hash string) bool {
-	if !validHash(hash) {
+	p, err := c.path(hash)
+	if err != nil {
 		return false
 	}
-	_, err := os.Stat(c.path(hash))
+	_, err = os.Stat(p)
 	return err == nil
 }
 
 // put stores data under hash after checking that they match.
 func (c *fileCache) put(hash string, data []byte) error {
-	if !validHash(hash) {
-		return fmt.Errorf("invalid sha256 %q", hash)
+	dst, err := c.path(hash)
+	if err != nil {
+		return err
 	}
 	sum := sha256.Sum256(data)
 	if hex.EncodeToString(sum[:]) != hash {
@@ -78,7 +93,7 @@ func (c *fileCache) put(hash string, data []byte) error {
 		os.Remove(tmp.Name())
 		return fmt.Errorf("write cache entry: %v %v", werr, cerr)
 	}
-	if err := os.Rename(tmp.Name(), c.path(hash)); err != nil {
+	if err := os.Rename(tmp.Name(), dst); err != nil {
 		os.Remove(tmp.Name())
 		if c.has(hash) { // another job stored it first
 			return nil
@@ -92,10 +107,11 @@ func (c *fileCache) put(hash string, data []byte) error {
 // verify reports whether the entry for hash exists and still matches it. An
 // entry that no longer matches is removed, so the client is asked to resend it.
 func (c *fileCache) verify(hash string) bool {
-	if !validHash(hash) {
+	p, err := c.path(hash)
+	if err != nil {
 		return false
 	}
-	f, err := os.Open(c.path(hash))
+	f, err := os.Open(p)
 	if err != nil {
 		return false
 	}
@@ -108,7 +124,7 @@ func (c *fileCache) verify(hash string) bool {
 	if hex.EncodeToString(h.Sum(nil)) == hash {
 		return true
 	}
-	os.Remove(c.path(hash))
+	os.Remove(p)
 	return false
 }
 
@@ -120,10 +136,10 @@ func (c *fileCache) verify(hash string) bool {
 // the entry before every use, so a job that altered its program can't affect
 // the next one.
 func (c *fileCache) linkTo(hash, dst string) error {
-	if !validHash(hash) {
-		return fmt.Errorf("invalid sha256 %q", hash)
+	src, err := c.path(hash)
+	if err != nil {
+		return err
 	}
-	src := c.path(hash)
 	_ = os.Chmod(src, 0o700) // links share permissions, and programs must be executable
 	if err := os.Link(src, dst); err != nil {
 		return c.copyTo(hash, dst)
@@ -137,10 +153,11 @@ func (c *fileCache) linkTo(hash, dst string) error {
 // so a job that modifies its input cannot corrupt the cache or the input of
 // another job running at the same time.
 func (c *fileCache) copyTo(hash, dst string) error {
-	if !validHash(hash) {
-		return fmt.Errorf("invalid sha256 %q", hash)
+	p, err := c.path(hash)
+	if err != nil {
+		return err
 	}
-	src, err := os.Open(c.path(hash))
+	src, err := os.Open(p)
 	if err != nil {
 		return fmt.Errorf("cached file %s: %w", hash[:12], err)
 	}
@@ -154,7 +171,7 @@ func (c *fileCache) copyTo(hash, dst string) error {
 		return err
 	}
 	now := time.Now()
-	_ = os.Chtimes(c.path(hash), now, now) // recently used entries survive eviction
+	_ = os.Chtimes(p, now, now) // recently used entries survive eviction
 	return out.Close()
 }
 
