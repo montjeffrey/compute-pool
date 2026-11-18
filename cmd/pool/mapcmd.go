@@ -269,6 +269,7 @@ func cmdMap(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 	fs.Var(&collect, "collect", "files to bring back from each task (glob relative to the job folder, repeatable)")
 	outDir := fs.String("out", "pool-out", "where collected files go, one folder per task")
 	nodes := fs.String("nodes", "", "comma-separated devices to use (default: every device with an agent)")
+	osFlag := fs.String("os", "same", `without --nodes, the system the tasks need: "same" as this device, "any", an OS such as linux, or os/arch such as linux/arm64`)
 	jobs := fs.Int("jobs", 0, "max tasks running at once across all devices (0 = every free slot)")
 	retries := fs.Int("retries", 2, "times to retry a task elsewhere if its device fails")
 	shell := fs.Bool("shell", false, "run each task through the device's shell")
@@ -301,6 +302,13 @@ func cmdMap(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 	if *taskTime < 0 {
 		return 2, errors.New("--task-time must be positive")
 	}
+	platform, err := client.ParsePlatform(*osFlag)
+	if err != nil {
+		return 2, fmt.Errorf("--os: %w", err)
+	}
+	if *nodes != "" && flagSet(fs, "os") {
+		return 2, errors.New("--os chooses among devices when --nodes is not given; named devices are used as named")
+	}
 	tasks, localInputs, err := buildTasks(*rangeSpec, *itemsFile, inputs, os.Stdin)
 	if err != nil {
 		return 2, err
@@ -312,9 +320,12 @@ func cmdMap(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 
 	c := client.New()
 	c.Port = *port
-	devices, err := mapDevices(ctx, c, *nodes, *probeTimeout)
+	devices, skipped, err := mapDevices(ctx, c, *nodes, *probeTimeout, platform)
 	if err != nil {
 		return 1, err
+	}
+	if *verbose {
+		fmt.Fprint(stderr, skippedNote(skipped, platform))
 	}
 	if *dryRun {
 		printPlan(stdout, advise.PlanJob(planDevices(devices), len(tasks), *taskTime, *jobs))
@@ -510,23 +521,28 @@ func printPlan(w io.Writer, p advise.Plan) {
 	}
 }
 
-// mapDevices finds every device whose agent answers, optionally limited to
-// the names in only. Paused devices are included: their slots wait and pick
-// up work when they resume. At least one device must be accepting now.
-func mapDevices(ctx context.Context, c *client.Client, only string, timeout time.Duration) ([]mapDevice, error) {
+// mapDevices finds every device whose agent answers and that runs platform,
+// or only the devices named in only, whatever they run. Paused devices are
+// included: their slots wait and pick up work when they resume. At least one
+// device must be accepting now. It also returns the devices left out because
+// they run another system.
+func mapDevices(ctx context.Context, c *client.Client, only string, timeout time.Duration, platform client.Platform) ([]mapDevice, []string, error) {
 	st, err := tsutil.GetStatus(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	want := map[string]bool{}
 	for _, n := range strings.Split(only, ",") {
 		if n = strings.TrimSpace(n); n != "" {
 			p, err := resolveOwned(st, n)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			want[p.Name] = true
 		}
+	}
+	if len(want) > 0 {
+		platform = client.Platform{} // devices named on purpose are used as named
 	}
 	var (
 		results []probeResult
@@ -538,7 +554,7 @@ func mapDevices(ctx context.Context, c *client.Client, only string, timeout time
 			continue
 		}
 		results = append(results, r)
-		if r.err != nil {
+		if r.err != nil || !platform.Matches(r.info) {
 			continue
 		}
 		devs = append(devs, mapDevice{Device: fanout.Device{Name: r.peer.Name, Slots: r.info.MaxJobs}, host: r.peer.IPv4,
@@ -546,9 +562,9 @@ func mapDevices(ctx context.Context, c *client.Client, only string, timeout time
 		cands = append(cands, client.Candidate{Name: r.peer.Name, Host: r.peer.IPv4, Info: r.info})
 	}
 	if len(client.Rank(cands)) == 0 {
-		return nil, fmt.Errorf("no device can take tasks right now (%s)%s", explain(results), pausedHint(results))
+		return nil, nil, noDeviceError("tasks", results, platform)
 	}
-	return devs, nil
+	return devs, otherSystems(results, platform), nil
 }
 
 // resultPrinter writes each task's output as one block, either as tasks

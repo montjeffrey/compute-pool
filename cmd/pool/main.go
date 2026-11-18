@@ -246,35 +246,85 @@ func describePower(hasBattery, onBattery bool, pct int) string {
 	return src
 }
 
-// pickTargets ranks every device that can take a job now. When none can, the
-// error says why for each device.
-func pickTargets(ctx context.Context, c *client.Client, timeout time.Duration) ([]client.Candidate, error) {
+// pickTargets ranks every device that runs want and can take a job now. When
+// none can, the error says why for each device.
+// It also returns the devices left out because they run another system.
+func pickTargets(ctx context.Context, c *client.Client, timeout time.Duration, want client.Platform) ([]client.Candidate, []string, error) {
 	st, err := tsutil.GetStatus(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	results := probeAll(ctx, st, c, timeout)
+	targets, err := chooseTargets(results, want)
+	return targets, otherSystems(results, want), err
+}
+
+// otherSystems names the devices whose agent answered but that do not run want.
+func otherSystems(results []probeResult, want client.Platform) []string {
+	var names []string
+	for _, r := range results {
+		if r.err == nil && !want.Matches(r.info) {
+			names = append(names, r.peer.Name)
+		}
+	}
+	return names
+}
+
+// skippedNote is the -v line about devices left out for running another
+// system, or "" when there are none.
+func skippedNote(names []string, want client.Platform) string {
+	if len(names) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("pool: not using %s: not running %s (--os any includes them)\n", strings.Join(names, ", "), want)
+}
+
+// chooseTargets ranks the devices whose agent answered, runs want and can
+// take a job now.
+func chooseTargets(results []probeResult, want client.Platform) ([]client.Candidate, error) {
 	var cands []client.Candidate
 	for _, r := range results {
-		if r.err == nil {
+		if r.err == nil && want.Matches(r.info) {
 			cands = append(cands, client.Candidate{Name: r.peer.Name, Host: r.peer.IPv4, Info: r.info})
 		}
 	}
 	if ranked := client.Rank(cands); len(ranked) > 0 {
 		return ranked, nil
 	}
-	return nil, fmt.Errorf("no device can take the job right now (%s)%s", explain(results), pausedHint(results))
+	return nil, noDeviceError("the job", results, want)
 }
 
-// explain says, per device, why it cannot take work.
-func explain(results []probeResult) string {
+// noDeviceError says, per device, why none of them can take what.
+func noDeviceError(what string, results []probeResult, want client.Platform) error {
+	var fits, other []probeResult
+	for _, r := range results {
+		if r.err == nil && !want.Matches(r.info) {
+			other = append(other, r)
+		} else {
+			fits = append(fits, r)
+		}
+	}
+	hint := pausedHint(fits)
+	if len(other) > 0 {
+		hint += fmt.Sprintf(". Work only goes to devices running %s; pass --os any to use every device, or --os with the system the command needs", want)
+	}
+	return fmt.Errorf("no device can take %s right now (%s)%s", what, explain(results, want), hint)
+}
+
+// explain says, per device, why it cannot take work that needs want.
+func explain(results []probeResult, want client.Platform) string {
 	if len(results) == 0 {
 		return "no online devices"
 	}
 	var why []string
 	for _, r := range results {
 		reason := probeStatus(r.err)
-		if r.err == nil {
+		switch {
+		case r.err == nil && !want.Matches(r.info) && r.info.OS == "":
+			reason = "did not report its system"
+		case r.err == nil && !want.Matches(r.info):
+			reason = "runs " + client.Platform{OS: r.info.OS, Arch: r.info.Arch}.String()
+		case r.err == nil:
 			reason = r.info.Reason
 		}
 		why = append(why, r.peer.Name+": "+reason)
@@ -312,6 +362,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 	fs.SetOutput(stderr)
 	node := fs.String("node", "auto", `device to run on: tailnet name, Tailscale IP, or "auto" for the least-loaded device`)
 	probeTimeout := fs.Duration("probe-timeout", time.Second, "with --node auto, how long to wait for each device's status")
+	osFlag := fs.String("os", "same", `with --node auto, the system the job needs: "same" as this device, "any", an OS such as linux, or os/arch such as linux/arm64`)
 	shell := fs.Bool("shell", false, "run through the device's shell (cmd.exe on Windows, /bin/sh elsewhere)")
 	timeout := fs.Duration("timeout", 0, "kill the job after this long (0 = no limit)")
 	port := fs.Int("port", proto.DefaultPort, "agent TCP port")
@@ -334,15 +385,25 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 		fs.Usage()
 		return 2, errors.New("a command is required")
 	}
+	platform, err := client.ParsePlatform(*osFlag)
+	if err != nil {
+		return 2, fmt.Errorf("--os: %w", err)
+	}
+	auto := *node == "" || *node == "auto"
+	if !auto && flagSet(fs, "os") {
+		return 2, errors.New("--os chooses among devices with --node auto; with a named --node, the job runs on that device")
+	}
 
 	c := client.New()
 	c.Port = *port
-	auto := *node == "" || *node == "auto"
 	var targets []client.Candidate
 	if auto {
-		var err error
-		if targets, err = pickTargets(ctx, c, *probeTimeout); err != nil {
+		var skipped []string
+		if targets, skipped, err = pickTargets(ctx, c, *probeTimeout, platform); err != nil {
 			return 1, err
+		}
+		if *verbose {
+			fmt.Fprint(stderr, skippedNote(skipped, platform))
 		}
 	} else {
 		// Even a raw IP is looked up, so it must be a tailnet device you own.
@@ -411,6 +472,13 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 // job that succeeded but whose results could not be brought back (an unsafe or
 // unmatched --collect pattern, say) fails, so a script does not carry on with
 // files that are missing.
+// flagSet reports whether the flag called name was given on the command line.
+func flagSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) { set = set || f.Name == name })
+	return set
+}
+
 func jobExitCode(res client.Result) int {
 	if res.ExitCode == 0 && res.RemoteError != "" {
 		return 1
