@@ -52,7 +52,12 @@ From its [terms](https://signpath.org/terms):
    Settings > Environments), limit its deployment branches and tags to the
    tag pattern `v*`, and store the token there as the environment secret
    `SIGNPATH_API_TOKEN`. Only the workflow's `sign` job uses that environment,
-   so no other job, and no other branch's workflow, can read the token.
+   so other jobs and branch pushes can't read the token. A `v*` tag on any
+   commit can, though, including one whose workflow was edited, so also add
+   yourself as a required reviewer of the environment (each release then
+   waits for your approval before the token is used) or limit who can create
+   `v*` tags with a tag ruleset. SignPath's own approval still guards every
+   signing request.
 7. Repository variables (same page, **Variables** tab):
 
    | Variable | Value |
@@ -75,7 +80,10 @@ Push the signed tag as usual (`git tag -s v0.2.0`, `git push origin v0.2.0`).
 The workflow's `build` job builds and uploads the two Windows binaries, and
 its `sign` job submits them and waits for the signing request. Approve it in
 SignPath within an hour; after that the `sign` job gives up and nothing is
-published. The `publish` job then puts the signed binaries in place, computes
+published. The `verify` job then checks, on Windows, that each signed binary's
+signature is `Valid` (trusted by Windows, as SignPath's test certificate is
+not), unless `RELEASE_AS_DRAFT` is `true`. The `publish` job then puts the
+signed binaries in place, computes
 `SHA256SUMS` and the provenance attestations from them, and publishes the
 release. Only `sign` sees the SignPath token, and it can't write to the
 repository.
@@ -96,11 +104,17 @@ subject.
   what the workflow's go-winres step sets. If you change one there, change it
   in `.signpath/artifact-configuration.xml` and paste the file into SignPath
   again. The copyright year is in both.
+- **"Windows doesn't trust its signature".** The `verify` job found a binary
+  whose signature isn't `Valid`, usually because the files were signed with a
+  test signing policy (`SIGNPATH_SIGNING_POLICY_SLUG` left over from a trial)
+  while `RELEASE_AS_DRAFT` isn't `true`. Nothing was published. Fix the
+  variables, delete the tag and push it again.
 - **"Expected 2 matches".** The configuration expects exactly the amd64 and
   arm64 binaries. Adding a Windows target means raising `min-matches` and
   `max-matches`.
 - **Timed out.** The request wasn't approved within the hour, so nothing was
-  published. Re-run the failed `sign` job (which also runs `publish`) and
-  approve the new request. SignPath's
+  published. Re-run the failed `sign` job (which also runs `verify` and
+  `publish`) within 7 days, while the build's files are kept, and approve the
+  new request; after that, push a new tag. SignPath's
   checks allow only a few re-runs of one workflow run (three, in its docs), so
   past that push a new tag.

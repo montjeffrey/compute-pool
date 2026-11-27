@@ -77,7 +77,10 @@ jobs:
           name: dist
           path: dist/
           if-no-files-found: error
-          retention-days: 1
+          # Long enough to re-run a timed-out sign job later (docs/code-signing.md).
+          retention-days: 7
+          # A re-run of this job uploads again into the same workflow run.
+          overwrite: true
       # Only the Windows binaries, so they sit at the root of the artifact's
       # zip, where .signpath/artifact-configuration.xml expects them.
       - name: Upload Windows binaries for signing
@@ -88,7 +91,7 @@ jobs:
           name: unsigned-windows
           path: dist/pool-*-windows-*.exe
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
           # A re-run of this job uploads again into the same workflow run.
           overwrite: true
 
@@ -135,14 +138,41 @@ jobs:
           name: signed-windows
           path: signed/
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
           overwrite: true
 
+  # Windows itself must trust each signed binary (Status Valid), which
+  # SignPath's test certificate never is. A release published from a test
+  # signing policy left in place after a trial would otherwise ship binaries
+  # Smart App Control blocks. Drafts (RELEASE_AS_DRAFT) skip the check, for
+  # that trial.
+  verify:
+    needs: sign
+    runs-on: windows-latest
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signed-windows
+          path: signed/
+      - name: Check Windows trusts the signatures
+        shell: pwsh
+        env:
+          DRAFT: ${{ vars.RELEASE_AS_DRAFT }}
+        run: |
+          $files = @(Get-ChildItem signed -Filter 'pool-*-windows-*.exe')
+          if ($files.Count -ne 2) { throw "expected 2 signed binaries, found $($files.Count)" }
+          foreach ($f in $files) {
+            $s = Get-AuthenticodeSignature -LiteralPath $f.FullName
+            "$($f.Name): $($s.Status), $($s.SignerCertificate.Subject)"
+            if ($s.Status -ne 'Valid' -and $env:DRAFT -ne 'true') { throw "$($f.Name) is $($s.Status); Windows doesn't trust its signature" }
+          }
+
   publish:
-    needs: [build, sign]
-    # Runs when signing succeeded or was skipped (not set up yet), never when
-    # it failed.
-    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.sign.result == 'success' || needs.sign.result == 'skipped') }}
+    needs: [build, sign, verify]
+    # Runs when signing succeeded and verified, or was skipped (not set up
+    # yet), never when either failed.
+    if: ${{ !cancelled() && needs.build.result == 'success' && ((needs.sign.result == 'success' && needs.verify.result == 'success') || (needs.sign.result == 'skipped' && needs.verify.result == 'skipped')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
