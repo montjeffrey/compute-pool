@@ -424,6 +424,8 @@ App Control still on. Microsoft doesn't document that, so don't rely on it.)
    would block a program (any program, not only pool). No events can also
    mean a program never ran, so run them in step 4. It prints the command
    that removes the policy: `deploy-policy.ps1 out\compute-pool-policy.xml -Remove`.
+   Once it is enforced, deploying it in audit mode again would replace it, so
+   that is refused unless Smart App Control is on (or you pass `-Force`).
 
 Programs that jobs ship (`--ship`, `poolbench`) are checked too, and unsigned
 ones are blocked; sign them, or ship scripts to an installed interpreter. The

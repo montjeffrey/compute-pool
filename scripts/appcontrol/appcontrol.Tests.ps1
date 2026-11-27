@@ -261,7 +261,13 @@ exit 0
         $signed = Join-Path $TestDrive 'signed-pool.exe'
         Copy-Item $unsigned $signed
         & "$dir\sign.ps1" $signed -Thumbprint $cert.Thumbprint | Out-Null
-        $common = @{ CiTool = "$d\fake-citool.ps1"; StateKey = $key; WorkRoot = (Join-Path $TestDrive 'work') }
+        # Stands in for Smart App Control's state; absent until a test sets it.
+        $sacKey = "$key-sac"
+        $common = @{ CiTool = "$d\fake-citool.ps1"; StateKey = $key; WorkRoot = (Join-Path $TestDrive 'work'); SmartAppControlKey = $sacKey }
+        function Set-SmartAppControl([int]$State) {
+            New-Item -Force $sacKey | Out-Null
+            Set-ItemProperty $sacKey -Name VerifiedAndReputablePolicyState -Value $State
+        }
         function Deploy { param([hashtable]$More = @{}, [string]$Xml = $policyXml)
             & "$d\deploy-policy.ps1" $Xml @common @More
         }
@@ -270,7 +276,7 @@ exit 0
         }
         Mock Get-WinEvent { Get-FakeLog $Oldest $FilterHashtable }
     }
-    AfterAll { if (Test-Path $key) { Remove-Item $key -Recurse } }
+    AfterAll { foreach ($k in $key, $sacKey) { if (Test-Path $k) { Remove-Item $k -Recurse } } }
     BeforeEach { Set-Listing $policyId.Trim('{}') }
 
     It 'needs -Mode' {
@@ -342,6 +348,31 @@ exit 0
         Deploy @{ Mode = 'enforce'; Program = $signed } | Out-Null
         (Get-ItemProperty $record).Mode | Should -Be 'enforce'
         (Get-FileHash $deployed).Hash | Should -Be (Get-FileHash (Join-Path $policyDir 'compute-pool-enforce.cip')).Hash
+    }
+    # The audit build has the enforced policy's ID, so it would replace it.
+    It 'refuses audit over the enforced policy while Smart App Control is off or unreadable' {
+        { Deploy @{ Mode = 'audit' } } | Should -Throw "*Smart App Control isn't on*"
+        Set-SmartAppControl 0
+        { Deploy @{ Mode = 'audit' } } | Should -Throw "*Smart App Control isn't on*"
+        (Get-ItemProperty $record).Mode | Should -Be 'enforce'
+        (Get-FileHash $deployed).Hash | Should -Be (Get-FileHash (Join-Path $policyDir 'compute-pool-enforce.cip')).Hash
+    }
+    It 'refuses audit over the enforced policy while Smart App Control only evaluates' {
+        Set-SmartAppControl 2
+        { Deploy @{ Mode = 'audit' } } | Should -Throw "*Smart App Control isn't on*"
+    }
+    It 'deploys audit over the enforced policy while Smart App Control is on' {
+        Set-SmartAppControl 1
+        Deploy @{ Mode = 'audit' } | Out-Null
+        (Get-ItemProperty $record).Mode | Should -Be 'audit'
+        (Get-FileHash $deployed).Hash | Should -Be (Get-FileHash (Join-Path $policyDir 'compute-pool-audit.cip')).Hash
+    }
+    It 'deploys audit over the enforced policy with -Force while Smart App Control is off' {
+        Set-ItemProperty $record -Name Mode -Value 'enforce'
+        Set-SmartAppControl 0
+        Deploy @{ Mode = 'audit'; Force = $true } | Out-Null
+        (Get-ItemProperty $record).Mode | Should -Be 'audit'
+        (Get-FileHash $deployed).Hash | Should -Be (Get-FileHash (Join-Path $policyDir 'compute-pool-audit.cip')).Hash
     }
     It 'removes the policy and its record' {
         Deploy @{ Remove = $true } | Out-Null
