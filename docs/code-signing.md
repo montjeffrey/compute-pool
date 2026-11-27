@@ -58,7 +58,12 @@ From its [terms](https://signpath.org/terms):
    waits for your approval before the token is used) or limit who can create
    `v*` tags with a tag ruleset. SignPath's own approval still guards every
    signing request.
-7. Repository variables (same page, **Variables** tab):
+7. Repository variables (GitHub > Settings > Secrets and variables >
+   Actions > **Variables** tab > **New repository variable**). They must be
+   repository variables, not variables of the `signpath` environment: the
+   `build` job, which runs outside that environment, reads
+   `SIGNPATH_ORGANIZATION_ID` to decide whether to sign, and skips signing
+   without an error if it can't see it.
 
    | Variable | Value |
    |---|---|

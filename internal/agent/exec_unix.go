@@ -49,8 +49,9 @@ const JobMemoryLimitEnforced = false
 // trackMemory returns a function that reports the job's peak memory in bytes
 // (0 if unknown) once it has exited: the largest resident size among the
 // job's process and the descendants it waited for. The memory limit is not
-// enforced (see JobMemoryLimitEnforced), so onLimit is never called.
-func trackMemory(cmd *exec.Cmd, _ int64, _ func()) func() uint64 {
+// enforced (see JobMemoryLimitEnforced), so onLimit is never called and
+// capped is false.
+func trackMemory(cmd *exec.Cmd, _ int64, _ func()) (peak func() uint64, capped bool) {
 	return func() uint64 {
 		if cmd.ProcessState == nil {
 			return 0
@@ -63,5 +64,5 @@ func trackMemory(cmd *exec.Cmd, _ int64, _ func()) func() uint64 {
 			return uint64(ru.Maxrss) // bytes on macOS
 		}
 		return uint64(ru.Maxrss) * 1024 // kilobytes elsewhere
-	}
+	}, false
 }

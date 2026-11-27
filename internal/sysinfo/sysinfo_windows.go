@@ -88,8 +88,21 @@ const (
 	jobObjectLimitJobMemory                     = 0x00000200
 	jobObjectLimitKillOnJobClose                = 0x00002000
 	jobObjectAssociateCompletionPortInformation = 7
+	jobObjectNotificationLimitInformation       = 12
 	jobObjectMsgJobMemoryLimit                  = 10
+	jobObjectMsgNotificationLimit               = 11
 )
+
+// jobNotificationLimit mirrors JOBOBJECT_NOTIFICATION_LIMIT_INFORMATION.
+type jobNotificationLimit struct {
+	IoReadBytesLimit             uint64
+	IoWriteBytesLimit            uint64
+	PerJobUserTimeLimit          int64
+	JobMemoryLimit               uint64
+	RateControlTolerance         uint32
+	RateControlToleranceInterval uint32
+	LimitFlags                   uint32
+}
 
 // jobAssociateCompletionPort mirrors JOBOBJECT_ASSOCIATE_COMPLETION_PORT.
 type jobAssociateCompletionPort struct {
@@ -104,33 +117,41 @@ type jobAssociateCompletionPort struct {
 // the process has exited. A process that is already in the agent's job
 // object nests this one inside it.
 //
-// If limitBytes is above zero, the processes together can't commit more
-// than that: an allocation beyond it fails, as it would on a device out of
-// memory, instead of pushing the owner's programs out to the page file.
+// If limitBytes is above zero, onLimit is called once as the processes
+// together come to commit more than limitBytes, for the caller to end them.
+// So that they can't push the owner's programs out to the page file before
+// it does, they also can't commit more than capMargin past the limit: an
+// allocation beyond that fails, as it would on a device out of memory.
 // Programs don't all fail cleanly when that happens (a Go program can stall
-// for good), so onLimit, if not nil, is called once when the job first
-// tries to go past the limit, for the caller to end it.
-func TrackMemory(pid int, limitBytes uint64, onLimit func()) func() uint64 {
+// for good), so the cap is set only if the notice can be set up (and onLimit
+// isn't nil); capped reports whether it was.
+func TrackMemory(pid int, limitBytes uint64, onLimit func()) (peak func() uint64, capped bool) {
 	none := func() uint64 { return 0 }
 	job, _, _ := procCreateJobObjectW.Call(0, 0)
 	if job == 0 {
-		return none
+		return none, false
+	}
+	var w *limitWatch
+	if limitBytes > 0 && onLimit != nil {
+		w = watchMemoryLimit(job, limitBytes, onLimit)
 	}
 	// Closing the job ends what the program left running, as killing the
 	// process group does on Unix; without the limit the job is still
 	// measured, so a failure here doesn't stop it from running.
 	var info jobExtendedLimit
 	info.BasicLimitInformation.LimitFlags = jobObjectLimitKillOnJobClose
-	if limitBytes > 0 {
+	if w != nil {
 		info.BasicLimitInformation.LimitFlags |= jobObjectLimitJobMemory
-		info.JobMemoryLimit = uintptr(limitBytes)
+		info.JobMemoryLimit = uintptr(limitBytes + capMargin(limitBytes))
 	}
 	r, _, _ := procSetInformationJobObject.Call(job, jobObjectExtendedLimitInformation,
 		uintptr(unsafe.Pointer(&info)), unsafe.Sizeof(info))
-	var w *limitWatch
-	if r != 0 && limitBytes > 0 && onLimit != nil {
-		w = watchMemoryLimit(job, onLimit)
+	if r == 0 && w != nil {
+		// No cap, so no notice either: the job runs, measured, as capped says.
+		w.stop()
+		w = nil
 	}
+	capped = w != nil
 	release := func() {
 		if w != nil {
 			w.stop()
@@ -141,35 +162,49 @@ func TrackMemory(pid int, limitBytes uint64, onLimit func()) func() uint64 {
 	h, err := syscall.OpenProcess(processSetQuota|processTerminate, false, uint32(pid))
 	if err != nil {
 		release()
-		return none
+		return none, false
 	}
 	r, _, _ = procAssignProcessToJobObject.Call(job, uintptr(h))
 	syscall.CloseHandle(h)
 	if r == 0 {
 		release()
-		return none
+		return none, false
 	}
 	return func() uint64 {
 		defer release()
 		peak, _ := JobPeakMemory(job)
 		return peak
-	}
+	}, capped
 }
+
+// capMargin is how far past a job's memory limit its hard cap is set: a
+// sixteenth of the limit, at most 256 MB. Commit can't pass the cap, so a
+// notice set at the cap itself might never fire, and the margin has to hold
+// the usual step a program grows by.
+func capMargin(limitBytes uint64) uint64 { return min(limitBytes/16, 256<<20) }
 
 // quitWatching, posted with key 0, tells a limitWatch's goroutine to stop;
 // the job's own messages carry the job handle as their key.
 const quitWatching = 0xFFFFFFFF
 
-// limitWatch waits for a job's memory-limit notice on a completion port.
+// limitWatch waits for a job's memory-limit notices on a completion port.
 type limitWatch struct {
 	port uintptr
 	done chan struct{}
 }
 
 // watchMemoryLimit has job report to a new completion port and calls
-// onLimit once when the job's memory limit is hit. It returns nil if the
-// port can't be set up.
-func watchMemoryLimit(job uintptr, onLimit func()) *limitWatch {
+// onLimit once when the job's memory passes limitBytes. It returns nil if
+// the port or the notice can't be set up.
+//
+// Windows delivers a notice for a limit set with
+// JobObjectNotificationLimitInformation for certain, but the hard cap's own
+// notice (jobObjectMsgJobMemoryLimit) only as a courtesy, so the job gets a
+// notification limit at limitBytes, below its cap (capMargin), and
+// whichever notice comes first ends it. A single allocation big enough to
+// jump from below the limit past the cap fails without reaching the
+// limit, which leaves only the courtesy notice.
+func watchMemoryLimit(job uintptr, limitBytes uint64, onLimit func()) *limitWatch {
 	p, err := syscall.CreateIoCompletionPort(syscall.InvalidHandle, 0, 0, 1)
 	if err != nil {
 		return nil
@@ -179,6 +214,15 @@ func watchMemoryLimit(job uintptr, onLimit func()) *limitWatch {
 	r, _, _ := procSetInformationJobObject.Call(job, jobObjectAssociateCompletionPortInformation,
 		uintptr(unsafe.Pointer(&assoc)), unsafe.Sizeof(assoc))
 	if r == 0 {
+		syscall.CloseHandle(p)
+		return nil
+	}
+	notice := jobNotificationLimit{JobMemoryLimit: limitBytes, LimitFlags: jobObjectLimitJobMemory}
+	r, _, _ = procSetInformationJobObject.Call(job, jobObjectNotificationLimitInformation,
+		uintptr(unsafe.Pointer(&notice)), unsafe.Sizeof(notice))
+	if r == 0 {
+		// The job stays tied to the port, which only drops its notices
+		// once closed.
 		syscall.CloseHandle(p)
 		return nil
 	}
@@ -200,7 +244,7 @@ func watchMemoryLimit(job uintptr, onLimit func()) *limitWatch {
 				// while this goroutine still waits on it.
 				syscall.CloseHandle(syscall.Handle(w.port))
 				return
-			case key == job && msg == jobObjectMsgJobMemoryLimit:
+			case key == job && (msg == jobObjectMsgNotificationLimit || msg == jobObjectMsgJobMemoryLimit):
 				once.Do(onLimit)
 			}
 		}

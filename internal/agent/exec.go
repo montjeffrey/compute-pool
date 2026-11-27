@@ -76,7 +76,7 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
 		if ctx.Err() != nil { // canceled before the process could start
-			if code, err := memoryStop(ctx); err != nil {
+			if code, err := memoryStop(context.Cause(ctx)); err != nil {
 				return code, 0, err
 			}
 			return exitCanceled, 0, errors.New("job canceled")
@@ -84,10 +84,13 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 		return exitNotStarted, 0, fmt.Errorf("start %s: %w", req.Argv[0], err)
 	}
 	lowerPriority(cmd)
-	peakMemory := trackMemory(cmd, limitMB, func() {
+	peakMemory, capped := trackMemory(cmd, limitMB, func() {
 		a.cfg.Logger.Printf("job %s stopped: it reached its memory limit of %d MB", jobID, limitMB)
 		stopJob(&memoryLimitError{node: a.cfg.NodeName, limitMB: limitMB})
 	})
+	if limitMB > 0 && JobMemoryLimitEnforced && !capped {
+		a.cfg.Logger.Printf("job %s runs without its memory limit of %d MB: the limit couldn't be set with a way to stop the job at it", jobID, limitMB)
+	}
 	a.jobStoppable(jobID, stopJob)
 	err = cmd.Wait()
 	dur := time.Since(start)
@@ -96,17 +99,19 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 	// the cause below is settled.
 	peak := peakMemory()
 
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	cause := stopCause(ctx, err)
+
+	if errors.Is(cause, context.DeadlineExceeded) {
 		a.mem.observe(peak)
 		return exitTimedOut, dur, fmt.Errorf("job timed out after %ds", req.TimeoutSec)
 	}
-	if code, err := memoryStop(ctx); err != nil {
+	if code, err := memoryStop(cause); err != nil {
 		// A job cut short over memory shows the limit or a partial use, not
 		// what jobs need, so it doesn't teach the estimate.
 		return code, dur, err
 	}
 	a.mem.observe(peak)
-	if ctx.Err() != nil {
+	if cause != nil {
 		return exitCanceled, dur, errors.New("job canceled")
 	}
 	code, runErr := 0, error(nil)
@@ -126,12 +131,24 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 	return code, dur, runErr
 }
 
-// memoryStop reports the exit code and reason if ctx was ended over memory,
-// or a nil error if not.
-func memoryStop(ctx context.Context) (int, error) {
+// stopCause is why the job's context ended, read once so the checks after
+// it agree, or nil if the job finished on its own. The low-memory guard can
+// still end the context after the job exits; cmd.Wait returns no error only
+// if the job succeeded before anything stopped it, so that job is reported
+// as it ended.
+func stopCause(ctx context.Context, waitErr error) error {
+	if waitErr == nil {
+		return nil
+	}
+	return context.Cause(ctx)
+}
+
+// memoryStop reports the exit code and reason if the job was stopped over
+// memory (cause is its context's cause), or a nil error if not.
+func memoryStop(cause error) (int, error) {
 	var low *lowMemoryError
 	var over *memoryLimitError
-	switch cause := context.Cause(ctx); {
+	switch {
 	case errors.As(cause, &low), errors.As(cause, &over):
 		return exitLowMemory, cause
 	}

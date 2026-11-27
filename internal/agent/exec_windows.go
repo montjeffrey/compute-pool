@@ -70,9 +70,11 @@ const JobMemoryLimitEnforced = true
 
 // trackMemory starts measuring the job's memory and, if limitMB is above
 // zero, caps what the job and its children can commit together, calling
-// onLimit once if they try to go past it. The returned function reports the
-// peak in bytes (0 if unknown) once the job has exited. A child the job
-// starts in the instant before tracking begins isn't counted or capped.
-func trackMemory(cmd *exec.Cmd, limitMB int64, onLimit func()) func() uint64 {
+// onLimit once as they reach it. capped reports whether the cap was set
+// (sysinfo.TrackMemory explains when it isn't). The returned function
+// reports the peak in bytes (0 if unknown) once the job has exited. A child
+// the job starts in the instant before tracking begins isn't counted or
+// capped.
+func trackMemory(cmd *exec.Cmd, limitMB int64, onLimit func()) (peak func() uint64, capped bool) {
 	return sysinfo.TrackMemory(cmd.Process.Pid, uint64(max(0, limitMB))<<20, onLimit)
 }

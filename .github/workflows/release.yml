@@ -150,23 +150,33 @@ jobs:
     needs: sign
     runs-on: windows-latest
     permissions: {}
+    # Whether every signature was Valid. publish reads it too, so re-running
+    # publish alone after a draft-mode verify can't publish a full release.
+    outputs:
+      trusted: ${{ steps.check.outputs.trusted }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: signed-windows
           path: signed/
       - name: Check Windows trusts the signatures
+        id: check
         shell: pwsh
         env:
           DRAFT: ${{ vars.RELEASE_AS_DRAFT }}
         run: |
           $files = @(Get-ChildItem signed -Filter 'pool-*-windows-*.exe')
           if ($files.Count -ne 2) { throw "expected 2 signed binaries, found $($files.Count)" }
+          $trusted = $true
           foreach ($f in $files) {
             $s = Get-AuthenticodeSignature -LiteralPath $f.FullName
             "$($f.Name): $($s.Status), $($s.SignerCertificate.Subject)"
-            if ($s.Status -ne 'Valid' -and $env:DRAFT -ne 'true') { throw "$($f.Name) is $($s.Status); Windows doesn't trust its signature" }
+            if ($s.Status -ne 'Valid') {
+              $trusted = $false
+              if ($env:DRAFT -ne 'true') { throw "$($f.Name) is $($s.Status); Windows doesn't trust its signature" }
+            }
           }
+          "trusted=$($trusted.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
   publish:
     needs: [build, sign, verify]
@@ -179,6 +189,19 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      # RELEASE_AS_DRAFT is read again here, so it may have changed since
+      # verify ran: a full release needs verify to have found every signature
+      # Valid, not only to have passed.
+      - name: Check signed binaries may be released
+        if: ${{ needs.sign.result == 'success' }}
+        env:
+          DRAFT: ${{ vars.RELEASE_AS_DRAFT }}
+          TRUSTED: ${{ needs.verify.outputs.trusted }}
+        run: |
+          if [ "$DRAFT" != true ] && [ "$TRUSTED" != true ]; then
+            echo "verify didn't find every signature Valid (trusted='$TRUSTED'), so only a draft release can be published; re-run the whole workflow"
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
