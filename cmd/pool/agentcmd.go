@@ -399,7 +399,7 @@ func defaultAgentLog() string {
 	return filepath.Join(filepath.Dir(capacity.DefaultPath()), "agent.log")
 }
 
-// describeJobMemoryLimit says how much memory one job may use.
+// describeJobMemoryLimit says past how much memory one job is ended.
 func describeJobMemoryLimit(mb int64) string {
 	switch {
 	case mb <= 0:
@@ -407,6 +407,6 @@ func describeJobMemoryLimit(mb int64) string {
 	case !agent.JobMemoryLimitEnforced:
 		return fmt.Sprintf("per-job memory limit of %.1f GB not enforced on this platform", float64(mb)/1024)
 	default:
-		return fmt.Sprintf("each job may use at most %.1f GB", float64(mb)/1024)
+		return fmt.Sprintf("each job is ended once it uses more than %.1f GB", float64(mb)/1024)
 	}
 }
