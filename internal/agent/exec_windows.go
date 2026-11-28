@@ -55,6 +55,14 @@ func killTree(cmd *exec.Cmd) error {
 	return nil
 }
 
+// killedByStop reports whether the job's process ended the way Cancel ends
+// it: taskkill /F and Process.Kill both leave exit code 1. A program that
+// exits with 1 itself just as a stop lands can't be told apart, and counts
+// as stopped. A process never waited for (state nil) counts as killed.
+func killedByStop(state *os.ProcessState) bool {
+	return state == nil || state.ExitCode() == 1
+}
+
 // reapTree is a no-op on Windows: once the main process has exited its
 // children can no longer be found by parent. The job's own job object ends
 // them instead when trackMemory's function releases it, and the agent-wide

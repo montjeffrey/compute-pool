@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -24,6 +25,17 @@ func buildCommand(ctx context.Context, req proto.RunRequest) *exec.Cmd {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	return cmd
+}
+
+// killedByStop reports whether the job's process ended the way Cancel ends
+// it (SIGKILL), not by exiting on its own. A process never waited for
+// (state nil) counts as killed.
+func killedByStop(state *os.ProcessState) bool {
+	if state == nil {
+		return true
+	}
+	ws, ok := state.Sys().(syscall.WaitStatus)
+	return !ok || ws.Signaled() && ws.Signal() == syscall.SIGKILL
 }
 
 // reapTree kills anything the job left running in its process group after

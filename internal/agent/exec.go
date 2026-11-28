@@ -73,13 +73,13 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 	cmd.Stdout = fw.Stream(proto.FrameStdout)
 	cmd.Stderr = fw.Stream(proto.FrameStderr)
 	cmd.WaitDelay = 5 * time.Second
-	// exec calls Cancel only if ctx ends while the process still runs, so
-	// killed tells a stop that ended the job from one that came after it
-	// had exited on its own.
-	var killed atomic.Bool
+	// exec calls Cancel if ctx ends before it has collected the process's
+	// exit, which can be just after the process exited on its own; how the
+	// process ended (killedByStop) tells the two apart.
+	var canceled atomic.Bool
 	kill := cmd.Cancel
 	cmd.Cancel = func() error {
-		killed.Store(true)
+		canceled.Store(true)
 		return kill()
 	}
 
@@ -118,7 +118,7 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 	// the cause below is settled.
 	peak := peakMemory()
 
-	cause := stopCause(ctx, err, killed.Load())
+	cause := stopCause(ctx, err, canceled.Load() && killedByStop(cmd.ProcessState))
 	var notSet *limitNotSetError
 	if errors.As(cause, &notSet) {
 		return exitNotStarted, dur, cause

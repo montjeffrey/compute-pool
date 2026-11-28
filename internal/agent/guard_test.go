@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"log"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -103,5 +105,35 @@ func TestStopCause(t *testing.T) {
 	}
 	if code, err := memoryStop(nil); code != 0 || err != nil {
 		t.Errorf("memoryStop(nil) = %d, %v, want 0, nil", code, err)
+	}
+}
+
+// TestKilledByStop covers a stop that reaches exec after the process has
+// exited but before Wait has returned: Cancel then runs, and only how the
+// process ended shows it ended on its own.
+func TestKilledByStop(t *testing.T) {
+	helper := func(mode string) *exec.Cmd {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$", "--", mode)
+		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+		return cmd
+	}
+	own := helper("fail") // exits 2 on its own
+	if err := own.Run(); err == nil {
+		t.Fatal("fail helper exited 0")
+	}
+	if killedByStop(own.ProcessState) {
+		t.Errorf("a job that exited 2 itself counts as killed (%v)", own.ProcessState)
+	}
+	stopped := helper("sleep")
+	if err := stopped.Start(); err != nil {
+		t.Fatal(err)
+	}
+	stopped.Process.Kill()
+	stopped.Wait()
+	if !killedByStop(stopped.ProcessState) {
+		t.Errorf("a killed job doesn't count as killed (%v)", stopped.ProcessState)
+	}
+	if !killedByStop(nil) {
+		t.Error("a job never waited for doesn't count as killed")
 	}
 }
