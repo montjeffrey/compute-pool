@@ -69,9 +69,8 @@ func lowerPriority(*exec.Cmd) {}
 const JobMemoryLimitEnforced = true
 
 // trackMemory starts measuring the job's memory and, if limitMB is above
-// zero, caps what the job and its children can commit together, calling
-// onLimit once as they reach it. capped reports whether the cap was set
-// (sysinfo.TrackMemory explains when it isn't). The returned function
+// zero, ends the job and its children as soon as they commit more than that
+// together, calling onLimit first. capped reports whether the limit was set. The returned function
 // reports the peak in bytes (0 if unknown) once the job has exited. A child
 // the job starts in the instant before tracking begins isn't counted or
 // capped.

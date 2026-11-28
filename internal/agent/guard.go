@@ -44,6 +44,18 @@ func (e *memoryLimitError) Error() string {
 	return fmt.Sprintf("stopped: the job reached its memory limit of %d MB on %s (--job-memory-limit)", e.limitMB, e.node)
 }
 
+// limitNotSetError is why a job was ended as it started: its memory limit
+// couldn't be set, and the agent doesn't run jobs past a limit it can't
+// hold them to.
+type limitNotSetError struct {
+	node    string
+	limitMB int64
+}
+
+func (e *limitNotSetError) Error() string {
+	return fmt.Sprintf("not run: %s couldn't set the job's memory limit of %d MB (--job-memory-limit 0 runs jobs without one)", e.node, e.limitMB)
+}
+
 // GuardMemory checks free memory every interval until ctx ends, stopping
 // the newest job whenever it is critically low. It does nothing without a
 // Probe that reports memory.

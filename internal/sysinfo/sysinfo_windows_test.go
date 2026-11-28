@@ -3,6 +3,7 @@ package sysinfo
 import (
 	"os"
 	"os/exec"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -63,58 +64,62 @@ func TestJobCPUTimes(t *testing.T) {
 }
 
 // TestHelperGrow is not a real test: TestTrackMemoryLimit runs this test
-// binary as a child that keeps allocating.
+// binary as a child that uses more and more memory, then waits.
 func TestHelperGrow(t *testing.T) {
-	if os.Getenv("SYSINFO_GROW") != "1" {
+	var keep [][]byte
+	switch os.Getenv("SYSINFO_GROW") {
+	case "steps": // 4 MB at a time up to 1 GB, touching each page
+		for i := 0; i < 256; i++ {
+			b := make([]byte, 4<<20)
+			for j := 0; j < len(b); j += 4096 {
+				b[j] = 1
+			}
+			keep = append(keep, b)
+		}
+	case "jump": // 1 GB in one allocation, far past the limit
+		keep = append(keep, make([]byte, 1<<30))
+	default:
 		return
 	}
-	var keep [][]byte
-	for i := 0; i < 256; i++ {
-		b := make([]byte, 4<<20)
-		for j := 0; j < len(b); j += 4096 {
-			b[j] = 1
-		}
-		keep = append(keep, b)
-	}
+	time.Sleep(time.Minute) // until the limit ends it
 	os.Exit(len(keep) & 0)
 }
 
 func TestTrackMemoryLimit(t *testing.T) {
-	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperGrow$")
-	cmd.Env = append(os.Environ(), "SYSINFO_GROW=1")
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	reached := make(chan struct{})
-	peak, capped := TrackMemory(cmd.Process.Pid, 128<<20, func() {
-		close(reached) // once only, or this panics
-		cmd.Process.Kill()
-	})
-	if !capped {
-		cmd.Process.Kill()
-		cmd.Wait()
-		peak()
-		t.Fatal("TrackMemory didn't set the limit")
-	}
-	select {
-	case <-reached:
-	case <-time.After(30 * time.Second):
-		cmd.Process.Kill()
-		t.Error("no notice within 30s of the job growing past its limit")
-	}
-	cmd.Wait()
-	if got, limit := peak(), uint64(128<<20); got <= limit || got > limit+capMargin(limit) {
-		t.Errorf("peak = %d bytes, want past the 128 MB limit and within its cap", got)
-	}
-}
-
-func TestCapMargin(t *testing.T) {
-	for _, c := range []struct{ limit, want uint64 }{
-		{128 << 20, 8 << 20},
-		{8 << 30, 256 << 20},
-	} {
-		if got := capMargin(c.limit); got != c.want {
-			t.Errorf("capMargin(%d) = %d, want %d", c.limit, got, c.want)
-		}
+	for _, mode := range []string{"steps", "jump"} {
+		t.Run(mode, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestHelperGrow$")
+			cmd.Env = append(os.Environ(), "SYSINFO_GROW="+mode)
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer cmd.Process.Kill()
+			reached := make(chan struct{})
+			const limit = 128 << 20
+			track, capped := TrackMemory(cmd.Process.Pid, limit, func() { close(reached) }) // once only, or this panics
+			peak := sync.OnceValue(track)                                                   // releases the job once
+			defer peak()
+			if !capped {
+				t.Fatal("TrackMemory didn't set the limit")
+			}
+			exited := make(chan error, 1)
+			go func() { exited <- cmd.Wait() }()
+			select {
+			case err := <-exited:
+				if err == nil {
+					t.Error("the job exited cleanly; want it ended by its limit")
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("the job wasn't ended within 30s of going past its limit")
+			}
+			select {
+			case <-reached:
+			default:
+				t.Error("onLimit wasn't called")
+			}
+			if got := peak(); got <= limit {
+				t.Errorf("peak = %d bytes, want past the %d-byte limit", got, limit)
+			}
+		})
 	}
 }

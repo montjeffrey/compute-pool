@@ -97,13 +97,15 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 	// capped covers the job's process and what it starts from now on, not
 	// a child it started in the instant since Start (a shell's command,
 	// say): that one isn't held to the limit, though stopping the job still
-	// ends it (killTree), as does the low-memory guard.
+	// ends it (killTree), as does the low-memory guard. On Windows the limit
+	// ends the job itself as it passes it, and onLimit gives the reason.
 	peakMemory, capped := trackMemory(cmd, limitMB, func() {
 		a.cfg.Logger.Printf("job %s stopped: it reached its memory limit of %d MB", jobID, limitMB)
 		stopJob(&memoryLimitError{node: a.cfg.NodeName, limitMB: limitMB})
 	})
 	if limitMB > 0 && JobMemoryLimitEnforced && !capped {
-		a.cfg.Logger.Printf("job %s runs without its memory limit of %d MB: the limit couldn't be set with a way to stop the job at it", jobID, limitMB)
+		a.cfg.Logger.Printf("job %s ended as it started: its memory limit of %d MB couldn't be set", jobID, limitMB)
+		stopJob(&limitNotSetError{node: a.cfg.NodeName, limitMB: limitMB})
 	}
 	a.jobStoppable(jobID, stopJob)
 	err = cmd.Wait()
@@ -117,6 +119,10 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 	peak := peakMemory()
 
 	cause := stopCause(ctx, err, killed.Load())
+	var notSet *limitNotSetError
+	if errors.As(cause, &notSet) {
+		return exitNotStarted, dur, cause
+	}
 
 	if errors.Is(cause, context.DeadlineExceeded) {
 		a.mem.observe(peak)
@@ -152,8 +158,8 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 // agree, or nil if it ended on its own and keeps its own exit status. The
 // guard, a timeout or a cancel can end ctx after the process has exited;
 // only one that killed it (killed) counts. A job that went past its memory
-// limit and then failed counts as stopped either way: the hard cap past
-// the limit refuses its allocations, so that is the likely failure.
+// limit counts as stopped either way: on Windows the limit ends the job
+// itself (sysinfo.TrackMemory), not through Cancel.
 func stopCause(ctx context.Context, waitErr error, killed bool) error {
 	if waitErr == nil {
 		return nil

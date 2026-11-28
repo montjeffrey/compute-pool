@@ -216,9 +216,10 @@ Memory is guarded harder than CPU, because a device that runs out of it
 starts paging and can stop responding altogether:
 
 - **Each job has a memory limit** (`--job-memory-limit`, default a third of
-  the device's memory, at least 1 GB): the job and everything it starts can't
-  commit more. A job that reaches it is stopped with exit code 137 and says
-  so. Enforced on Windows; Linux and macOS don't enforce it yet.
+  the device's memory, at least 1 GB): the job and everything it starts are
+  ended as soon as they commit more, with exit code 137 and the reason. A
+  device that can't set the limit doesn't run the job. Enforced on Windows;
+  Linux and macOS don't enforce it yet.
 - **Running jobs are stopped when free memory gets critically low**: below
   half the reserve kept for you (the larger of 512 MB and a twentieth of
   RAM), the agent stops its newest job, waits ten seconds for the memory to

@@ -17,6 +17,7 @@ var (
 	procSetInformationJobObject   = kernel32.NewProc("SetInformationJobObject")
 	procGetQueuedCompletionStatus = kernel32.NewProc("GetQueuedCompletionStatus")
 	procAssignProcessToJobObject  = kernel32.NewProc("AssignProcessToJobObject")
+	procTerminateJobObject        = kernel32.NewProc("TerminateJobObject")
 	procGlobalMemoryStatusEx      = kernel32.NewProc("GlobalMemoryStatusEx")
 )
 
@@ -89,7 +90,6 @@ const (
 	jobObjectLimitKillOnJobClose                = 0x00002000
 	jobObjectAssociateCompletionPortInformation = 7
 	jobObjectNotificationLimitInformation       = 12
-	jobObjectMsgJobMemoryLimit                  = 10
 	jobObjectMsgNotificationLimit               = 11
 )
 
@@ -117,39 +117,30 @@ type jobAssociateCompletionPort struct {
 // the process has exited. A process that is already in the agent's job
 // object nests this one inside it.
 //
-// If limitBytes is above zero, onLimit is called once as the processes
-// together come to commit more than limitBytes, for the caller to end them.
-// So that they can't push the owner's programs out to the page file before
-// it does, they also can't commit more than capMargin past the limit: an
-// allocation beyond that fails, as it would on a device out of memory.
-// Programs don't all fail cleanly when that happens (a Go program can stall
-// for good), so the cap is set only if the notice can be set up (and onLimit
-// isn't nil); capped reports whether it was.
+// If limitBytes is above zero, the processes are ended together as soon as
+// they commit more than limitBytes, after onLimit (if not nil) is called
+// once to say why. capped reports whether that limit could be set. There is
+// no hard cap that refuses allocations: programs don't all fail cleanly when
+// one is refused (a Go program can stall for good at a job's cap), and Windows
+// only reports a refusal on a best-effort basis, so the job could wait
+// forever. The notice for the limit used here is guaranteed instead, and
+// ending the job object takes no new process, so a job goes little past its
+// limit before it ends.
 func TrackMemory(pid int, limitBytes uint64, onLimit func()) (peak func() uint64, capped bool) {
 	none := func() uint64 { return 0 }
 	job, _, _ := procCreateJobObjectW.Call(0, 0)
 	if job == 0 {
 		return none, false
 	}
-	var w *limitWatch
-	if limitBytes > 0 && onLimit != nil {
-		w = watchMemoryLimit(job, limitBytes, onLimit)
-	}
 	// Closing the job ends what the program left running, as killing the
-	// process group does on Unix; without the limit the job is still
-	// measured, so a failure here doesn't stop it from running.
+	// process group does on Unix. The job is still measured if this fails.
 	var info jobExtendedLimit
 	info.BasicLimitInformation.LimitFlags = jobObjectLimitKillOnJobClose
-	if w != nil {
-		info.BasicLimitInformation.LimitFlags |= jobObjectLimitJobMemory
-		info.JobMemoryLimit = uintptr(limitBytes + capMargin(limitBytes))
-	}
-	r, _, _ := procSetInformationJobObject.Call(job, jobObjectExtendedLimitInformation,
+	procSetInformationJobObject.Call(job, jobObjectExtendedLimitInformation,
 		uintptr(unsafe.Pointer(&info)), unsafe.Sizeof(info))
-	if r == 0 && w != nil {
-		// No cap, so no notice either: the job runs, measured, as capped says.
-		w.stop()
-		w = nil
+	var w *limitWatch
+	if limitBytes > 0 {
+		w = watchMemoryLimit(job, limitBytes, onLimit)
 	}
 	capped = w != nil
 	release := func() {
@@ -164,7 +155,7 @@ func TrackMemory(pid int, limitBytes uint64, onLimit func()) (peak func() uint64
 		release()
 		return none, false
 	}
-	r, _, _ = procAssignProcessToJobObject.Call(job, uintptr(h))
+	r, _, _ := procAssignProcessToJobObject.Call(job, uintptr(h))
 	syscall.CloseHandle(h)
 	if r == 0 {
 		release()
@@ -177,12 +168,6 @@ func TrackMemory(pid int, limitBytes uint64, onLimit func()) (peak func() uint64
 	}, capped
 }
 
-// capMargin is how far past a job's memory limit its hard cap is set: a
-// sixteenth of the limit, at most 256 MB. Commit can't pass the cap, so a
-// notice set at the cap itself might never fire, and the margin has to hold
-// the usual step a program grows by.
-func capMargin(limitBytes uint64) uint64 { return min(limitBytes/16, 256<<20) }
-
 // quitWatching, posted with key 0, tells a limitWatch's goroutine to stop;
 // the job's own messages carry the job handle as their key.
 const quitWatching = 0xFFFFFFFF
@@ -193,17 +178,11 @@ type limitWatch struct {
 	done chan struct{}
 }
 
-// watchMemoryLimit has job report to a new completion port and calls
-// onLimit once when the job's memory passes limitBytes. It returns nil if
-// the port or the notice can't be set up.
-//
-// Windows delivers a notice for a limit set with
-// JobObjectNotificationLimitInformation for certain, but the hard cap's own
-// notice (jobObjectMsgJobMemoryLimit) only as a courtesy, so the job gets a
-// notification limit at limitBytes, below its cap (capMargin), and
-// whichever notice comes first ends it. A single allocation big enough to
-// jump from below the limit past the cap fails without reaching the
-// limit, which leaves only the courtesy notice.
+// watchMemoryLimit has job report to a new completion port and, once its
+// memory passes limitBytes, calls onLimit (if not nil) and ends every
+// process in it. It returns nil if the port or the limit can't be set up.
+// Windows delivers the notice for a limit set with
+// JobObjectNotificationLimitInformation for certain.
 func watchMemoryLimit(job uintptr, limitBytes uint64, onLimit func()) *limitWatch {
 	p, err := syscall.CreateIoCompletionPort(syscall.InvalidHandle, 0, 0, 1)
 	if err != nil {
@@ -244,8 +223,13 @@ func watchMemoryLimit(job uintptr, limitBytes uint64, onLimit func()) *limitWatc
 				// while this goroutine still waits on it.
 				syscall.CloseHandle(syscall.Handle(w.port))
 				return
-			case key == job && (msg == jobObjectMsgNotificationLimit || msg == jobObjectMsgJobMemoryLimit):
-				once.Do(onLimit)
+			case key == job && msg == jobObjectMsgNotificationLimit:
+				once.Do(func() {
+					if onLimit != nil {
+						onLimit() // first, so the reason is set before the job ends
+					}
+					procTerminateJobObject.Call(job, 1)
+				})
 			}
 		}
 	}()
