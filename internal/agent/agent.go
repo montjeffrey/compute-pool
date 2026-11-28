@@ -49,6 +49,10 @@ type Config struct {
 	// JobMemoryMB is the memory each job is assumed to need until the agent
 	// has measured finished jobs (default DefaultJobMemoryMB).
 	JobMemoryMB int64
+	// JobMemoryLimitMB is the memory one job, with every process it
+	// starts, can commit before it is ended; 0 means no limit. Only
+	// enforced where JobMemoryLimitEnforced is true.
+	JobMemoryLimitMB int64
 
 	// CacheDir keeps shipped files by content hash between jobs; empty
 	// disables caching. CacheBytes caps its size (default 2 GiB).
@@ -78,7 +82,8 @@ type Agent struct {
 
 	histMu  sync.Mutex
 	active  map[string]*proto.JobRecord
-	history []proto.JobRecord // finished jobs, oldest first, at most historySize
+	stops   map[string]context.CancelCauseFunc // ends a started job, by ID
+	history []proto.JobRecord                  // finished jobs, oldest first, at most historySize
 
 	admitMu   sync.Mutex
 	admitted  map[uint64]time.Time // job slots taken, with when
@@ -87,6 +92,10 @@ type Agent struct {
 
 	hostsMu      sync.RWMutex
 	allowedHosts map[string]bool // empty: any Host header
+
+	beforeWait func(pid int)       // tests only: runs as each job's process has started, before Wait
+	afterWait  func()              // tests only: runs as each job's process has exited
+	onCancel   func(killErr error) // tests only: runs as exec stops a job's process, with the kill's result
 }
 
 const historySize = 50
@@ -105,6 +114,17 @@ func (a *Agent) jobStarted(id, from string, req proto.RunRequest) {
 	a.active[id] = &proto.JobRecord{ID: id, From: from, Command: describeCommand(req), Started: time.Now(), Running: true}
 }
 
+// jobStoppable lets the low-memory guard end job id through stop, once its
+// process is running. A job still writing its inputs holds little memory,
+// so stopping it would free nothing.
+func (a *Agent) jobStoppable(id string, stop context.CancelCauseFunc) {
+	a.histMu.Lock()
+	defer a.histMu.Unlock()
+	if _, ok := a.active[id]; ok {
+		a.stops[id] = stop
+	}
+}
+
 func (a *Agent) jobFinished(id string, code int, dur time.Duration, err error) {
 	a.histMu.Lock()
 	defer a.histMu.Unlock()
@@ -113,6 +133,7 @@ func (a *Agent) jobFinished(id string, code int, dur time.Duration, err error) {
 		return
 	}
 	delete(a.active, id)
+	delete(a.stops, id)
 	rec.Running, rec.ExitCode, rec.DurationMS = false, code, dur.Milliseconds()
 	if err != nil {
 		rec.Error = err.Error()
@@ -217,6 +238,7 @@ func New(cfg Config) (*Agent, error) {
 		mem:       memEstimate{def: cfg.JobMemoryMB},
 		started:   time.Now(),
 		active:    make(map[string]*proto.JobRecord),
+		stops:     make(map[string]context.CancelCauseFunc),
 		admitted:  make(map[uint64]time.Time),
 		lastLimit: -1,
 	}

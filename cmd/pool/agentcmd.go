@@ -37,6 +37,7 @@ type agentFlags struct {
 	busyThreshold *float64
 	cacheMB       *int64
 	jobMemory     *int64
+	jobMemLimit   *int64
 	logFile       *string
 	hideConsole   *bool
 }
@@ -54,6 +55,7 @@ func newAgentFlags(name string, stderr io.Writer) (*flag.FlagSet, *agentFlags) {
 		busyThreshold: fs.Float64("busy-threshold", 80, "refuse new jobs while CPU use is at or above this percent (0 = never)"),
 		cacheMB:       fs.Int64("cache-mb", 2048, "disk space for caching shipped files between jobs (0 = no cache)"),
 		jobMemory:     fs.Int64("job-memory", agent.DefaultJobMemoryMB, "memory in MB to assume each job needs until jobs have been measured"),
+		jobMemLimit:   fs.Int64("job-memory-limit", -1, "memory in MB past which a job, with everything it starts, is ended (-1 = a third of this device's memory, 0 = no limit; enforced on Windows)"),
 		logFile:       fs.String("log-file", "", "append the agent's log to this file instead of stderr"),
 		hideConsole:   fs.Bool("hide-console", false, "detach from the console window (used by the startup task)"),
 	}
@@ -100,6 +102,13 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 		logger.Printf("warning: can't tell this agent's jobs from other programs; the busy threshold counts both")
 	}
 	go sampler.Run(ctx, 2*time.Second)
+	memLimitMB := *f.jobMemLimit
+	if memLimitMB < 0 {
+		memLimitMB = 0
+		if m := sampler.Snapshot().Memory; m.Known {
+			memLimitMB = agent.DefaultJobMemoryLimitMB(m.TotalMB)
+		}
+	}
 
 	// Other devices use these to weigh this one; pool setup saves the
 	// measurement, and an agent without one simply doesn't report it.
@@ -130,20 +139,21 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 			allowed := append([]string{st.Self.Name}, strings.Split(*f.allow, ",")...)
 			auth := agent.NewTailnetAuthorizer(st.SelfLogin, allowed)
 			a, err = agent.New(agent.Config{
-				NodeName:      st.Self.Name,
-				MaxJobs:       *f.maxJobs,
-				WorkDir:       *f.workDir,
-				Auth:          auth,
-				Logger:        logger,
-				Probe:         sampler.Snapshot,
-				LendOnBattery: *f.lendOnBattery,
-				BusyThreshold: *f.busyThreshold,
-				CacheDir:      cacheDir,
-				CacheBytes:    *f.cacheMB << 20,
-				JobMemoryMB:   *f.jobMemory,
-				Specs:         &specs,
-				Capacity:      measured,
-				LogPath:       logPath,
+				NodeName:         st.Self.Name,
+				MaxJobs:          *f.maxJobs,
+				WorkDir:          *f.workDir,
+				Auth:             auth,
+				Logger:           logger,
+				Probe:            sampler.Snapshot,
+				LendOnBattery:    *f.lendOnBattery,
+				BusyThreshold:    *f.busyThreshold,
+				CacheDir:         cacheDir,
+				CacheBytes:       *f.cacheMB << 20,
+				JobMemoryMB:      *f.jobMemory,
+				JobMemoryLimitMB: memLimitMB,
+				Specs:            &specs,
+				Capacity:         measured,
+				LogPath:          logPath,
 			})
 			if err != nil {
 				return err
@@ -156,7 +166,10 @@ func cmdAgent(ctx context.Context, args []string, stderr io.Writer) error {
 			if m := sampler.Snapshot().Memory; m.Known {
 				logger.Printf("memory: %.1f of %.1f GB free; planning %d MB per job until jobs are measured; fewer jobs while other programs use the CPU or memory runs short",
 					float64(m.FreeMB)/1024, float64(m.TotalMB)/1024, *f.jobMemory)
+				logger.Printf("memory safety: %s; running jobs are stopped, newest first, while free memory is below %.1f GB",
+					describeJobMemoryLimit(memLimitMB), float64(agent.CriticalMemoryMB(m.TotalMB))/1024)
 			}
+			go a.GuardMemory(ctx, 2*time.Second)
 		}
 
 		addr, boundIP := *f.listen, ""
@@ -384,4 +397,16 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // saved measurement, which on Windows is where pool install logs too.
 func defaultAgentLog() string {
 	return filepath.Join(filepath.Dir(capacity.DefaultPath()), "agent.log")
+}
+
+// describeJobMemoryLimit says past how much memory one job is ended.
+func describeJobMemoryLimit(mb int64) string {
+	switch {
+	case mb <= 0:
+		return "no per-job memory limit"
+	case !agent.JobMemoryLimitEnforced:
+		return fmt.Sprintf("per-job memory limit of %.1f GB not enforced on this platform", float64(mb)/1024)
+	default:
+		return fmt.Sprintf("each job is ended once it uses more than %.1f GB", float64(mb)/1024)
+	}
 }

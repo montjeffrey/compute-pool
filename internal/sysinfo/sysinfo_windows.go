@@ -3,6 +3,7 @@
 package sysinfo
 
 import (
+	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -13,7 +14,10 @@ var (
 	procGetSystemPowerStatus      = kernel32.NewProc("GetSystemPowerStatus")
 	procQueryInformationJobObject = kernel32.NewProc("QueryInformationJobObject")
 	procCreateJobObjectW          = kernel32.NewProc("CreateJobObjectW")
+	procSetInformationJobObject   = kernel32.NewProc("SetInformationJobObject")
+	procGetQueuedCompletionStatus = kernel32.NewProc("GetQueuedCompletionStatus")
 	procAssignProcessToJobObject  = kernel32.NewProc("AssignProcessToJobObject")
+	procTerminateJobObject        = kernel32.NewProc("TerminateJobObject")
 	procGlobalMemoryStatusEx      = kernel32.NewProc("GlobalMemoryStatusEx")
 )
 
@@ -81,34 +85,166 @@ func JobPeakMemory(h uintptr) (uint64, error) {
 	return uint64(info.PeakJobMemoryUsed), nil
 }
 
+const (
+	jobObjectLimitJobMemory                     = 0x00000200
+	jobObjectLimitKillOnJobClose                = 0x00002000
+	jobObjectAssociateCompletionPortInformation = 7
+	jobObjectNotificationLimitInformation       = 12
+	jobObjectMsgNotificationLimit               = 11
+)
+
+// jobNotificationLimit mirrors JOBOBJECT_NOTIFICATION_LIMIT_INFORMATION.
+type jobNotificationLimit struct {
+	IoReadBytesLimit             uint64
+	IoWriteBytesLimit            uint64
+	PerJobUserTimeLimit          int64
+	JobMemoryLimit               uint64
+	RateControlTolerance         uint32
+	RateControlToleranceInterval uint32
+	LimitFlags                   uint32
+}
+
+// jobAssociateCompletionPort mirrors JOBOBJECT_ASSOCIATE_COMPLETION_PORT.
+type jobAssociateCompletionPort struct {
+	CompletionKey  uintptr
+	CompletionPort uintptr
+}
+
 // TrackMemory puts process pid, and the processes it starts from now on, in
 // a job object of their own so their combined peak memory can be read. The
 // returned function reports that peak in bytes (0 if unknown) and releases
-// the job object; call it once, after the process has exited. A process that
-// is already in the agent's job object nests this one inside it.
-func TrackMemory(pid int) func() uint64 {
+// the job object, which ends any process still in it; call it once, after
+// the process has exited. A process that is already in the agent's job
+// object nests this one inside it.
+//
+// If limitBytes is above zero, the processes are ended together as soon as
+// they commit more than limitBytes, after onLimit (if not nil) is called
+// once to say why. capped reports whether that limit could be set. There is
+// no hard cap that refuses allocations: programs don't all fail cleanly when
+// one is refused (a Go program can stall for good at a job's cap), and Windows
+// only reports a refusal on a best-effort basis, so the job could wait
+// forever. The notice for the limit used here is guaranteed instead, and
+// ending the job object takes no new process, so a job goes little past its
+// limit before it ends.
+func TrackMemory(pid int, limitBytes uint64, onLimit func()) (peak func() uint64, capped bool) {
 	none := func() uint64 { return 0 }
 	job, _, _ := procCreateJobObjectW.Call(0, 0)
 	if job == 0 {
-		return none
+		return none, false
+	}
+	// Closing the job ends what the program left running, as killing the
+	// process group does on Unix. The job is still measured if this fails.
+	var info jobExtendedLimit
+	info.BasicLimitInformation.LimitFlags = jobObjectLimitKillOnJobClose
+	procSetInformationJobObject.Call(job, jobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)), unsafe.Sizeof(info))
+	var w *limitWatch
+	if limitBytes > 0 {
+		w = watchMemoryLimit(job, limitBytes, onLimit)
+	}
+	capped = w != nil
+	release := func() {
+		if w != nil {
+			w.stop()
+		}
+		syscall.CloseHandle(syscall.Handle(job))
 	}
 	const processSetQuota, processTerminate = 0x0100, 0x0001
 	h, err := syscall.OpenProcess(processSetQuota|processTerminate, false, uint32(pid))
 	if err != nil {
-		syscall.CloseHandle(syscall.Handle(job))
-		return none
+		release()
+		return none, false
 	}
 	r, _, _ := procAssignProcessToJobObject.Call(job, uintptr(h))
 	syscall.CloseHandle(h)
 	if r == 0 {
-		syscall.CloseHandle(syscall.Handle(job))
-		return none
+		release()
+		return none, false
 	}
 	return func() uint64 {
-		defer syscall.CloseHandle(syscall.Handle(job))
+		defer release()
 		peak, _ := JobPeakMemory(job)
 		return peak
+	}, capped
+}
+
+// quitWatching, posted with key 0, tells a limitWatch's goroutine to stop;
+// the job's own messages carry the job handle as their key.
+const quitWatching = 0xFFFFFFFF
+
+// limitWatch waits for a job's memory-limit notices on a completion port.
+type limitWatch struct {
+	port uintptr
+	done chan struct{}
+}
+
+// watchMemoryLimit has job report to a new completion port and, once its
+// memory passes limitBytes, calls onLimit (if not nil) and ends every
+// process in it. It returns nil if the port or the limit can't be set up.
+// Windows delivers the notice for a limit set with
+// JobObjectNotificationLimitInformation for certain.
+func watchMemoryLimit(job uintptr, limitBytes uint64, onLimit func()) *limitWatch {
+	p, err := syscall.CreateIoCompletionPort(syscall.InvalidHandle, 0, 0, 1)
+	if err != nil {
+		return nil
 	}
+	w := &limitWatch{port: uintptr(p), done: make(chan struct{})}
+	assoc := jobAssociateCompletionPort{CompletionKey: job, CompletionPort: w.port}
+	r, _, _ := procSetInformationJobObject.Call(job, jobObjectAssociateCompletionPortInformation,
+		uintptr(unsafe.Pointer(&assoc)), unsafe.Sizeof(assoc))
+	if r == 0 {
+		syscall.CloseHandle(p)
+		return nil
+	}
+	notice := jobNotificationLimit{JobMemoryLimit: limitBytes, LimitFlags: jobObjectLimitJobMemory}
+	r, _, _ = procSetInformationJobObject.Call(job, jobObjectNotificationLimitInformation,
+		uintptr(unsafe.Pointer(&notice)), unsafe.Sizeof(notice))
+	if r == 0 {
+		// The job stays tied to the port, which only drops its notices
+		// once closed.
+		syscall.CloseHandle(p)
+		return nil
+	}
+	go func() {
+		defer close(w.done)
+		var once sync.Once
+		for {
+			var msg uint32
+			var key, overlapped uintptr
+			// The message comes in the byte count. The call fails only if
+			// the port was closed (see stop).
+			r, _, _ := procGetQueuedCompletionStatus.Call(w.port, uintptr(unsafe.Pointer(&msg)),
+				uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&overlapped)), syscall.INFINITE)
+			switch {
+			case r == 0:
+				return
+			case key == 0 && msg == quitWatching:
+				// Closed here, not in stop, so the handle can't be reused
+				// while this goroutine still waits on it.
+				syscall.CloseHandle(syscall.Handle(w.port))
+				return
+			case key == job && msg == jobObjectMsgNotificationLimit:
+				once.Do(func() {
+					if onLimit != nil {
+						onLimit() // first, so the reason is set before the job ends
+					}
+					procTerminateJobObject.Call(job, 1)
+				})
+			}
+		}
+	}()
+	return w
+}
+
+// stop ends the watching and returns once every notice already queued,
+// including a memory-limit one, has been handled.
+func (w *limitWatch) stop() {
+	if err := syscall.PostQueuedCompletionStatus(syscall.Handle(w.port), quitWatching, 0, nil); err != nil {
+		// Closing the port wakes the goroutine instead; it then returns
+		// without closing it again.
+		syscall.CloseHandle(syscall.Handle(w.port))
+	}
+	<-w.done
 }
 
 // memoryStatusEx mirrors MEMORYSTATUSEX.

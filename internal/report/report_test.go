@@ -90,7 +90,7 @@ func TestParseLines(t *testing.T) {
 	w.job(t0.Add(time.Second), 1500*time.Millisecond, 0, "prog", "two words", `quote"d`)
 	w.job(t0.Add(2*time.Second), 300*time.Millisecond, 3, "prog")
 	w.add(t0.Add(3*time.Second), "refused GET /v1/run from 100.64.0.9: not allowed")
-	w.add(t0.Add(3*time.Second), `refused GET "/v1/info" from 100.83.94.81: identify 100.83.94.81: tailscale whois --json 100.83.94.81: context canceled: `)
+	w.add(t0.Add(3*time.Second), `refused GET "/v1/info" from 100.64.0.7: identify 100.64.0.7: tailscale whois --json 100.64.0.7: context canceled: `)
 	w.add(t0.Add(3*time.Second), `refused POST "/v1/run" from 100.64.0.3: forbidden: node sales-box is not on the allow list`)
 	w.add(t0.Add(4*time.Second), "job limit now 0: 0.5 GB of memory free")
 	w.add(t0.Add(64*time.Second), "job limit now 2")
@@ -411,10 +411,10 @@ func TestRefusedUnidentified(t *testing.T) {
 		line string
 		want bool
 	}{
-		{`refused GET "/v1/info" from 100.83.94.81: identify 100.83.94.81: tailscale whois --json 100.83.94.81: context canceled: `, true},
-		{`refused GET "/v1/info" from 100.83.94.81: identify 100.83.94.81: tailscale whois --json 100.83.94.81: exit status 1: `, true},
-		{`refused GET "/v1/info" from 100.83.94.81: identify 100.83.94.81: tailscale whois --json 100.83.94.81: exec: canceling Cmd: TerminateProcess: Access is denied.: `, true},
-		{`refused GET /v1/info from 100.83.94.81: identify 100.83.94.81: context deadline exceeded`, true}, // agents before 0.1.5
+		{`refused GET "/v1/info" from 100.64.0.7: identify 100.64.0.7: tailscale whois --json 100.64.0.7: context canceled: `, true},
+		{`refused GET "/v1/info" from 100.64.0.7: identify 100.64.0.7: tailscale whois --json 100.64.0.7: exit status 1: `, true},
+		{`refused GET "/v1/info" from 100.64.0.7: identify 100.64.0.7: tailscale whois --json 100.64.0.7: exec: canceling Cmd: TerminateProcess: Access is denied.: `, true},
+		{`refused GET /v1/info from 100.64.0.7: identify 100.64.0.7: context deadline exceeded`, true}, // agents before 0.1.5
 		{`refused GET "/v1/info" from 100.64.0.4: forbidden: laptop belongs to mallory@github, not alice@github`, false},
 		{`refused GET "/v1/info" from 100.64.0.3: forbidden: node sales-box is not on the allow list`, false},
 		{`refused GET "/v1/info" from 192.168.1.10: forbidden: 192.168.1.10 is not a Tailscale address`, false},
@@ -434,7 +434,7 @@ func TestReliabilitySeparatesRefusals(t *testing.T) {
 	var w logWriter
 	w.agentStart(t0, "0.1.5", 2)
 	for i := 0; i < 3; i++ {
-		w.add(t0.Add(time.Duration(i+1)*time.Second), `refused GET "/v1/info" from 100.83.94.81: identify 100.83.94.81: tailscale whois --json 100.83.94.81: context canceled: `)
+		w.add(t0.Add(time.Duration(i+1)*time.Second), `refused GET "/v1/info" from 100.64.0.7: identify 100.64.0.7: tailscale whois --json 100.64.0.7: context canceled: `)
 	}
 	w.add(t0.Add(5*time.Second), `refused GET "/v1/info" from 100.64.0.4: forbidden: laptop belongs to mallory@github, not alice@github`)
 	rep := Analyze([]Device{{Log: mustParse(t, w.render(precise))}}, Options{})

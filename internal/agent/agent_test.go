@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,6 +43,18 @@ func TestHelperProcess(t *testing.T) {
 		os.Exit(2)
 	}
 	switch args[1] {
+	case "fail", "fail1", "pass", "poolcode":
+		// Leave a result, then exit on its own.
+		_ = os.WriteFile("result.txt", []byte("partial"), 0o644)
+		switch args[1] {
+		case "fail1":
+			os.Exit(1) // what taskkill /F leaves on Windows
+		case "pass":
+			os.Exit(0)
+		case "poolcode":
+			os.Exit(stoppedExitCode) // what the agent's own stop leaves on Windows
+		}
+		os.Exit(2)
 	case "echo":
 		fmt.Fprint(os.Stdout, "hello from job\n")
 		fmt.Fprint(os.Stderr, "warning from job\n")
@@ -75,6 +88,18 @@ func TestHelperProcess(t *testing.T) {
 			b[i] = 1
 		}
 		runtime.KeepAlive(b)
+	case "grow":
+		// Allocate 4 MB at a time up to 1 GB, touching each page, so a
+		// memory limit is reached gradually rather than by one huge request.
+		var keep [][]byte
+		for i := 0; i < 256; i++ {
+			b := make([]byte, 4<<20)
+			for j := 0; j < len(b); j += 4096 {
+				b[j] = 1
+			}
+			keep = append(keep, b)
+		}
+		runtime.KeepAlive(keep)
 	case "sleep":
 		time.Sleep(time.Minute)
 	case "spawn":
@@ -86,6 +111,19 @@ func TestHelperProcess(t *testing.T) {
 		}
 		fmt.Println("spawned")
 		time.Sleep(time.Minute)
+	case "leave":
+		// Start a grandchild and exit at once, leaving it behind.
+		child := exec.Command(os.Args[0], "-test.run=TestHelperProcess", "--", "heartbeat")
+		child.Env = os.Environ()
+		if err := child.Start(); err != nil {
+			os.Exit(1)
+		}
+		for i := 0; i < 200; i++ { // until it has written once
+			if _, err := os.Stat(os.Getenv("HEARTBEAT_FILE")); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	case "heartbeat":
 		deadline := time.Now().Add(30 * time.Second) // never outlive a broken test for long
 		for i := 0; time.Now().Before(deadline); i++ {
@@ -294,6 +332,23 @@ func TestCancelKillsWholeProcessTree(t *testing.T) {
 	after, _ := os.ReadFile(beat)
 	if !bytes.Equal(before, after) {
 		t.Errorf("grandchild still running after cancel (heartbeat %s -> %s)", before, after)
+	}
+}
+
+func TestFinishedJobLeavesNothingRunning(t *testing.T) {
+	h := newHarness(t, 1, allowAll{})
+	beat := filepath.Join(t.TempDir(), "heartbeat")
+	res, _, stderr, err := h.run(t, context.Background(), helperRequest(t, "leave", map[string]string{"HEARTBEAT_FILE": beat}))
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("res=%+v err=%v stderr=%s", res, err, stderr)
+	}
+	// If the grandchild survived the job, it keeps rewriting the file.
+	time.Sleep(300 * time.Millisecond)
+	before, _ := os.ReadFile(beat)
+	time.Sleep(500 * time.Millisecond)
+	after, _ := os.ReadFile(beat)
+	if len(before) == 0 || !bytes.Equal(before, after) {
+		t.Errorf("grandchild still running after the job finished (heartbeat %q -> %q)", before, after)
 	}
 }
 
@@ -870,6 +925,182 @@ func TestJobMemoryIsMeasured(t *testing.T) {
 	// The job used 200 MB on top of the test binary itself.
 	if !info.JobMemoryMeasured || info.JobMemoryMB < 200 || info.JobMemoryMB > 1024 {
 		t.Errorf("job memory = %d MB (measured %v), want 200-1024", info.JobMemoryMB, info.JobMemoryMeasured)
+	}
+}
+
+func TestJobMemoryLimit(t *testing.T) {
+	if !agent.JobMemoryLimitEnforced {
+		t.Skip("job memory limit not enforced on " + runtime.GOOS)
+	}
+	h := newHarnessWith(t, 1, allowAll{}, func(c *agent.Config) { c.JobMemoryLimitMB = 128 })
+	res, _, _, err := h.run(t, context.Background(), helperRequest(t, "grow", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 137 || !strings.Contains(res.RemoteError, "memory limit of 128 MB") {
+		t.Errorf("job growing past its limit: exit=%d remote error=%q, want 137 and the limit", res.ExitCode, res.RemoteError)
+	}
+	// The same job runs to the end without a limit.
+	h = newHarness(t, 1, allowAll{})
+	if res, _, stderr, err := h.run(t, context.Background(), helperRequest(t, "grow", nil)); err != nil || res.ExitCode != 0 {
+		t.Errorf("without a limit: res=%+v err=%v stderr=%s", res, err, stderr)
+	}
+}
+
+func TestGuardStopAfterExitKeepsJobsOwnResult(t *testing.T) {
+	probe := &lockedProbe{snap: sysinfo.Snapshot{CPUBusyPct: -1, OwnBusyPct: -1, Power: sysinfo.Power{BatteryPct: -1},
+		Memory: sysinfo.Memory{Known: true, TotalMB: 16384, FreeMB: 8000}}}
+	h := newHarnessWith(t, 1, allowAll{}, func(c *agent.Config) { c.Probe = probe.get })
+	stopped := false
+	// Memory runs short just after the job exited on its own, before the
+	// agent has reported it.
+	h.agent.SetAfterWait(func() {
+		probe.setFreeMB(300)
+		stopped = h.agent.RelieveMemory()
+	})
+	req := helperRequest(t, "fail", nil)
+	req.Collect = []string{"result.txt"}
+	res, _, _, err := h.run(t, context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stopped {
+		t.Fatal("the guard didn't stop the job, so this tests nothing")
+	}
+	if res.ExitCode != 2 || res.RemoteError != "" {
+		t.Errorf("exit=%d remote error=%q, want the job's own 2 and no error", res.ExitCode, res.RemoteError)
+	}
+	if got, err := os.ReadFile(filepath.Join(h.outDir, "result.txt")); err != nil || string(got) != "partial" {
+		t.Errorf("collected result.txt = %q, %v; want %q", got, err, "partial")
+	}
+}
+
+// The guard's stop lands after the job's process has exited on its own but
+// before the agent has collected its exit, so exec still calls Cancel on it.
+func TestGuardStopBeforeWaitKeepsJobsOwnResult(t *testing.T) {
+	if !agent.CanWatchExit {
+		t.Skip("can't see a process exit before it is collected on " + runtime.GOOS)
+	}
+	ownCode := stoppedExitCode
+	if runtime.GOOS != "windows" {
+		ownCode &= 0xff // exit statuses are 8 bits
+	}
+	for _, tc := range []struct {
+		mode string
+		code int
+	}{
+		{"pass", 0},
+		{"fail1", 1},          // the exit code of a kill by taskkill /F
+		{"poolcode", ownCode}, // the exit code of the agent's own stop on Windows
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			probe := &lockedProbe{snap: sysinfo.Snapshot{CPUBusyPct: -1, OwnBusyPct: -1, Power: sysinfo.Power{BatteryPct: -1},
+				Memory: sysinfo.Memory{Known: true, TotalMB: 16384, FreeMB: 8000}}}
+			h := newHarnessWith(t, 1, allowAll{}, func(c *agent.Config) { c.Probe = probe.get })
+			type race struct {
+				exited, stopped, canceled bool
+				exitErr, killErr          error
+			}
+			raced := make(chan race, 1)
+			kills := make(chan error, 1)
+			h.agent.SetOnCancel(func(err error) { kills <- err })
+			h.agent.SetBeforeWait(func(pid int) {
+				var r race
+				r.exited, r.exitErr = agent.WaitExited(pid, 30*time.Second)
+				probe.setFreeMB(300)
+				r.stopped = h.agent.RelieveMemory()
+				select {
+				case r.killErr = <-kills:
+					r.canceled = true
+				case <-time.After(10 * time.Second):
+				}
+				raced <- r
+			})
+			req := helperRequest(t, tc.mode, nil)
+			req.Collect = []string{"result.txt"}
+			res, _, _, err := h.run(t, context.Background(), req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := <-raced
+			if !r.exited || r.exitErr != nil {
+				t.Fatalf("the job's process didn't exit before the stop (%v), so this tests nothing", r.exitErr)
+			}
+			if !r.stopped || !r.canceled {
+				t.Fatalf("stopped=%v canceled=%v: the guard's stop didn't reach exec's Cancel, so this tests nothing", r.stopped, r.canceled)
+			}
+			if runtime.GOOS == "windows" && !errors.Is(r.killErr, os.ErrProcessDone) {
+				t.Errorf("killing the exited process: %v, want os.ErrProcessDone", r.killErr)
+			}
+			if res.ExitCode != tc.code || res.RemoteError != "" {
+				t.Errorf("exit=%d remote error=%q, want the job's own %d and no error", res.ExitCode, res.RemoteError, tc.code)
+			}
+			if got, err := os.ReadFile(filepath.Join(h.outDir, "result.txt")); err != nil || string(got) != "partial" {
+				t.Errorf("collected result.txt = %q, %v; want %q", got, err, "partial")
+			}
+		})
+	}
+}
+
+// stoppedExitCode is the exit code the agent's own stop leaves on Windows
+// (exec_windows.go).
+const stoppedExitCode = 0x504F4F4C
+
+// lockedProbe is a fixedProbe that is safe to change while the agent reads it.
+type lockedProbe struct {
+	mu   sync.Mutex
+	snap sysinfo.Snapshot
+}
+
+func (p *lockedProbe) get() sysinfo.Snapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.snap
+}
+
+func (p *lockedProbe) setFreeMB(mb int64) {
+	p.mu.Lock()
+	p.snap.Memory.FreeMB = mb
+	p.mu.Unlock()
+}
+
+func TestLowMemoryGuardEndsJob(t *testing.T) {
+	probe := &lockedProbe{snap: sysinfo.Snapshot{CPUBusyPct: -1, OwnBusyPct: -1, Power: sysinfo.Power{BatteryPct: -1},
+		Memory: sysinfo.Memory{Known: true, TotalMB: 16384, FreeMB: 8000}}}
+	h := newHarnessWith(t, 1, allowAll{}, func(c *agent.Config) { c.Probe = probe.get })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.agent.GuardMemory(ctx, 10*time.Millisecond)
+
+	type outcome struct {
+		res client.Result
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, _, _, err := h.run(t, context.Background(), helperRequest(t, "sleep", nil))
+		done <- outcome{res, err}
+	}()
+	waitFor(t, "sleep job to start", func() bool { return h.agent.Running() == 1 })
+	time.Sleep(50 * time.Millisecond)
+	if h.agent.Running() != 1 {
+		t.Fatal("guard stopped a job with plenty of memory free")
+	}
+
+	probe.setFreeMB(300) // the owner opened something big
+	select {
+	case o := <-done:
+		if o.err != nil {
+			t.Fatal(o.err)
+		}
+		if o.res.ExitCode != 137 || !strings.Contains(o.res.RemoteError, "ran low on memory") {
+			t.Errorf("stopped job: exit=%d remote error=%q, want 137 and a low-memory reason", o.res.ExitCode, o.res.RemoteError)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("guard did not stop the job")
+	}
+	if recent := h.agent.Jobs().Recent; len(recent) != 1 || recent[0].ExitCode != 137 {
+		t.Errorf("history = %+v", recent)
 	}
 }
 

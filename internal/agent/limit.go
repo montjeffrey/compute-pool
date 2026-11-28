@@ -11,8 +11,10 @@ import (
 
 // How many jobs the agent takes is decided again for every job: MaxJobs is
 // the most it ever runs, and the live limit is lower while the owner's own
-// programs use the CPU or free memory runs short. Jobs already running are
-// never stopped; the agent just takes no more until there is room.
+// programs use the CPU or free memory runs short. Jobs already running keep
+// going; the agent just takes no more until there is room. The one exception
+// is free memory falling to a critical level, when the low-memory guard
+// stops jobs (see guard.go).
 
 const (
 	// DefaultJobMemoryMB is the memory assumed per job until the agent has
@@ -69,6 +71,11 @@ func (m *memEstimate) get() (int64, bool) {
 // and a tenth of the device's memory. Programs already open are excluded
 // from free memory, so this is room for whatever the owner starts next.
 func memoryReserveMB(totalMB int64) int64 { return max(1024, totalMB/10) }
+
+// DefaultJobMemoryLimitMB is the default cap on one job's memory: a third of
+// the device's memory, and at least 1 GB. A JVM's default heap is a quarter
+// of memory, and the cap counts its other memory too.
+func DefaultJobMemoryLimitMB(totalMB int64) int64 { return max(1024, totalMB/3) }
 
 type limitInput struct {
 	maxJobs  int

@@ -37,8 +37,11 @@ your `PATH`. Release binaries are built by GitHub Actions from the tagged
 commit. They aren't code-signed yet, so Windows may warn before running them, and
 on a PC with Smart App Control turned on it may refuse to run them at all.
 Smart App Control judges each file separately, so one release can run while the
-next is blocked. [Application control](#application-control-windows) covers
-signing your own builds and trusting them with an App Control policy.
+next is blocked. Signing through SignPath Foundation is being set up (see
+[Code signing policy](#code-signing-policy)); once it's live, Windows release
+binaries are signed and Smart App Control lets them run. Until then,
+[Application control](#application-control-windows) covers signing your own
+builds and trusting them with an App Control policy.
 
 Releases after v0.1.0 also carry build provenance: a signed record that each
 binary was built by this repository's release workflow. Check it with the
@@ -49,6 +52,32 @@ gh attestation verify pool-0.1.4-windows-amd64.exe --repo montjeffrey/compute-po
 ```
 
 Release tags from v0.1.1 on are signed, and show as **Verified** on GitHub.
+
+### Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io),
+certificate by [SignPath Foundation](https://signpath.org). (The application
+is pending; until it's approved, releases are unsigned.)
+
+Only Windows binaries built by this repository's release workflow on
+GitHub-hosted runners, from a release tag the maintainer pushes, are
+submitted for signing, and each signing request is approved by hand before
+anything is signed. Setup and the release steps are
+in [docs/code-signing.md](docs/code-signing.md).
+
+- Committers and reviewers: [Jeffrey Montoya](https://github.com/montjeffrey),
+  the sole maintainer. Changes from anyone else arrive as pull requests and
+  are reviewed before merging.
+- Approvers: [Jeffrey Montoya](https://github.com/montjeffrey).
+
+Everyone with these roles uses multi-factor authentication on GitHub and
+SignPath.
+
+Privacy: this program will not transfer any information to other networked
+systems unless specifically requested by the user or the person installing or
+operating it. pool connects only to the agents on the devices you add to your
+pool (over your Tailscale network) and sends them the jobs you run; it
+contacts no other server.
 
 ## Splitting work with `pool map`
 
@@ -180,7 +209,24 @@ laptop                 windows/amd64  16    13.4  16%   0/2   battery 65%  pause
 
 Owner activity is judged from total CPU load, not keyboard or mouse input:
 an agent started over SSH or as a service can't see the desktop session's input.
-Jobs already running are not paused; they keep below-normal priority.
+Jobs already running aren't paused when the CPU gets busy; they keep
+below-normal priority.
+
+Memory is guarded harder than CPU, because a device that runs out of it
+starts paging and can stop responding altogether:
+
+- **Each job has a memory limit** (`--job-memory-limit`, default a third of
+  the device's memory, at least 1 GB): the job and everything it starts are
+  ended as soon as they commit more, with exit code 137 and the reason. They
+  aren't refused memory first, because a program refused memory can hang for
+  good, so a job that allocates a lot at once commits it for the moment
+  before it ends. A device that can't set the limit doesn't run the job. Enforced on Windows;
+  Linux and macOS don't enforce it yet.
+- **Running jobs are stopped when free memory gets critically low**: below
+  half the reserve kept for you (the larger of 512 MB and a twentieth of
+  RAM), the agent stops its newest job, waits ten seconds for the memory to
+  come back, and repeats while it stays low. These jobs also end with exit
+  code 137 and give the reason.
 
 ## How it stays safe
 
@@ -204,7 +250,9 @@ layers:
   so a device shared into your tailnet can't pose as an idle agent to receive them.
 - Traffic is encrypted by Tailscale's WireGuard tunnel.
 - Jobs run at **below-normal priority** in a fresh scratch folder (deleted
-  afterwards). Canceling (Ctrl+C) or `--timeout` kills the **whole process tree**.
+  afterwards), with a **memory limit** and a low-memory guard (see
+  [How placement works](#how-placement-works)). Canceling (Ctrl+C) or
+  `--timeout` kills the **whole process tree**.
 
 [SECURITY.md](SECURITY.md) has the full threat model, the known limits, and how
 to report a vulnerability.
@@ -308,7 +356,7 @@ never as SYSTEM, and stores no password:
 
 - From an elevated shell it runs **at startup**, before anyone logs in, with no window.
   Otherwise it runs **at logon** (a console window flashes once and hides).
-- A watchdog trigger relaunches the agent within a minute if it dies.
+- A watchdog trigger relaunches the agent within five minutes if it dies.
   Task Scheduler's own restart-on-failure only covers launch failures.
 - It keeps running on battery; the agent's own policy decides whether to lend CPU.
 - The log is `%LOCALAPPDATA%\compute-pool\agent.log` (rotated at 10 MB).
@@ -379,6 +427,8 @@ App Control still on. Microsoft doesn't document that, so don't rely on it.)
    would block a program (any program, not only pool). No events can also
    mean a program never ran, so run them in step 4. It prints the command
    that removes the policy: `deploy-policy.ps1 out\compute-pool-policy.xml -Remove`.
+   Once it is enforced, deploying it in audit mode again would replace it, so
+   that is refused unless Smart App Control is on (or you pass `-Force`).
 
 Programs that jobs ship (`--ship`, `poolbench`) are checked too, and unsigned
 ones are blocked; sign them, or ship scripts to an installed interpreter. The
@@ -402,7 +452,7 @@ the agents use.
 | Command | Flags |
 |---|---|
 | `pool setup` | Measures this device, recommends agent settings and, once you confirm, installs the agent with them (on Linux and macOS it prints the `pool agent` command instead). `--json` print the recommendation and change nothing · `--yes` apply without asking · `--no-measure` use the saved measurement or the specs · `--measure-time 2s` · `--allow a,b` · `--keep N` threads to keep free for you · `--job-memory 512` MB per job |
-| `pool agent` | `--allow a,b` devices that may submit jobs (this device is always allowed) · `--max-jobs N` (default: half the logical CPUs) · `--lend-on-battery` · `--busy-threshold 80` (0 = never pause) · `--cache-mb 2048` · `--job-memory 512` MB to assume each job needs until jobs have been measured · `--port 7470` · `--work-dir` · `--listen` · `--log-file FILE` log to a file instead of stderr · `--hide-console` detach from the console window (the startup task uses it) |
+| `pool agent` | `--allow a,b` devices that may submit jobs (this device is always allowed) · `--max-jobs N` (default: half the logical CPUs) · `--lend-on-battery` · `--busy-threshold 80` (0 = never pause) · `--job-memory-limit MB` (default a third of RAM; 0 = none; Windows) · `--cache-mb 2048` · `--job-memory 512` MB to assume each job needs until jobs have been measured · `--port 7470` · `--work-dir` · `--listen` · `--log-file FILE` log to a file instead of stderr · `--hide-console` detach from the console window (the startup task uses it) |
 | `pool run [--node N] -- cmd args...` | `--node auto` (default) or a device name/IP · `--shell` run via cmd.exe or /bin/sh · `--ship` · `--collect` · `--out pool-out` · `--timeout D` (0 = no limit) · `--env K=V` (repeatable) · `-v` shows where the job went · `--probe-timeout 1s` · `--port 7470` |
 | `pool map (--range A..B \| --items F \| --inputs GLOB) -- cmd {}` | `--ship` · `--collect` · `--out pool-out` · `--nodes a,b` · `--jobs N` · `--retries 2` · `--speculate` · `--keep-order` · `--shell` · `--timeout` · `--env K=V` · `-v` · `--dry-run` predict how the tasks would spread over the devices and run nothing · `--task-time D` with `--dry-run`, how long one task takes alone on this device · `--probe-timeout 1s` · `--port 7470` |
 | `pool nodes` | `--timeout 1s` · `--port 7470` |

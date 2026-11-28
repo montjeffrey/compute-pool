@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -26,6 +27,17 @@ func buildCommand(ctx context.Context, req proto.RunRequest) *exec.Cmd {
 	return cmd
 }
 
+// killedByStop reports whether the job's process ended the way Cancel ends
+// it (SIGKILL), not by exiting on its own. A process never waited for
+// (state nil) counts as killed.
+func killedByStop(state *os.ProcessState) bool {
+	if state == nil {
+		return true
+	}
+	ws, ok := state.Sys().(syscall.WaitStatus)
+	return !ok || ws.Signaled() && ws.Signal() == syscall.SIGKILL
+}
+
 // reapTree kills anything the job left running in its process group after
 // the main process exited, so background children can't outlive the job,
 // its slot accounting, or its scratch directory.
@@ -39,10 +51,19 @@ func lowerPriority(cmd *exec.Cmd) {
 	_ = syscall.Setpriority(syscall.PRIO_PGRP, cmd.Process.Pid, 10)
 }
 
+// JobMemoryLimitEnforced reports whether Config.JobMemoryLimitMB takes
+// effect on this platform. It doesn't here: an address-space rlimit would
+// break programs that reserve far more than they use (Go, Java, browsers),
+// and cgroups need setup the agent can't assume. The low-memory guard still
+// applies.
+const JobMemoryLimitEnforced = false
+
 // trackMemory returns a function that reports the job's peak memory in bytes
 // (0 if unknown) once it has exited: the largest resident size among the
-// job's process and the descendants it waited for.
-func trackMemory(cmd *exec.Cmd) func() uint64 {
+// job's process and the descendants it waited for. The memory limit is not
+// enforced (see JobMemoryLimitEnforced), so onLimit is never called and
+// capped is false.
+func trackMemory(cmd *exec.Cmd, _ int64, _ func()) (peak func() uint64, capped bool) {
 	return func() uint64 {
 		if cmd.ProcessState == nil {
 			return 0
@@ -55,5 +76,5 @@ func trackMemory(cmd *exec.Cmd) func() uint64 {
 			return uint64(ru.Maxrss) // bytes on macOS
 		}
 		return uint64(ru.Maxrss) * 1024 // kilobytes elsewhere
-	}
+	}, false
 }

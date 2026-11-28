@@ -29,7 +29,11 @@
 #
 # A policy can only add restrictions: while Smart App Control is on, it still
 # blocks whatever it blocked before. The policy takes Smart App Control's
-# place once you turn that off.
+# place once you turn that off. For that reason -Mode audit refuses to replace
+# this policy once it is enforced while Smart App Control isn't on (off, in
+# evaluation, or unreadable): that would leave nothing blocking unknown
+# programs. Turn
+# Smart App Control on first, or pass -Force.
 #Requires -RunAsAdministrator
 #Requires -Version 7
 param(
@@ -41,7 +45,9 @@ param(
     [switch]$Force,
     [string]$StateKey = 'HKLM:\SOFTWARE\compute-pool\appcontrol',
     [string]$WorkRoot = (Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'compute-pool-appcontrol'),
-    [string]$CiTool = (Join-Path ([Environment]::SystemDirectory) 'CiTool.exe')
+    [string]$CiTool = (Join-Path ([Environment]::SystemDirectory) 'CiTool.exe'),
+    # Where Windows keeps Smart App Control's state (0 off, 1 on, 2 evaluation).
+    [string]$SmartAppControlKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy'
 )
 $ErrorActionPreference = 'Stop'
 if (-not $Remove -and -not $Mode) { throw '-Mode audit or -Mode enforce is required (or -Remove)' }
@@ -107,6 +113,15 @@ try {
         if (Test-Path $record) { Remove-Item $record -Recurse }
         "Removed $name $id."
         return
+    }
+
+    if ($Mode -eq 'audit' -and -not $Force -and (Test-Path $record) -and (Get-ItemProperty $record).Mode -eq 'enforce') {
+        # The audit build has the same ID, so it would replace the enforced one.
+        $sac = (Get-ItemProperty -LiteralPath $SmartAppControlKey -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState
+        # Only 1 blocks anything; evaluation mode (2) only watches.
+        if ($sac -ne 1) {
+            throw "policy $id is enforced and Smart App Control isn't on (state '$sac'), so deploying it in audit mode would leave nothing blocking unknown programs; turn Smart App Control on first, or -Force"
+        }
     }
 
     if ($Mode -eq 'enforce' -and -not $Force) {

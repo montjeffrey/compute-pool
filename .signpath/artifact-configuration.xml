@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration for compute-pool releases.
+
+  SignPath doesn't read this file from the repository: paste it into the
+  project's artifact configuration in SignPath (docs/code-signing.md) and
+  paste it again whenever it changes here.
+
+  The release workflow uploads only the Windows binaries, so the artifact's
+  zip holds pool-<version>-windows-amd64.exe and -arm64.exe at its root.
+  Each must carry the version details the workflow's go-winres step sets;
+  keep these values in step with .github/workflows/release.yml. The workflow
+  passes "version" as the tag without its leading "v".
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <pe-file path="pool-*-windows-*.exe" min-matches="2" max-matches="2"
+             product-name="compute-pool"
+             product-version="${version}"
+             original-filename="pool.exe"
+             copyright="Copyright (c) 2026 Jeffrey Montoya">
+      <authenticode-sign />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>
