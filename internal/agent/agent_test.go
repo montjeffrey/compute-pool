@@ -43,6 +43,10 @@ func TestHelperProcess(t *testing.T) {
 		os.Exit(2)
 	}
 	switch args[1] {
+	case "fail":
+		// Leave a result, then fail on its own.
+		_ = os.WriteFile("result.txt", []byte("partial"), 0o644)
+		os.Exit(2)
 	case "echo":
 		fmt.Fprint(os.Stdout, "hello from job\n")
 		fmt.Fprint(os.Stderr, "warning from job\n")
@@ -932,6 +936,34 @@ func TestJobMemoryLimit(t *testing.T) {
 	h = newHarness(t, 1, allowAll{})
 	if res, _, stderr, err := h.run(t, context.Background(), helperRequest(t, "grow", nil)); err != nil || res.ExitCode != 0 {
 		t.Errorf("without a limit: res=%+v err=%v stderr=%s", res, err, stderr)
+	}
+}
+
+func TestGuardStopAfterExitKeepsJobsOwnResult(t *testing.T) {
+	probe := &lockedProbe{snap: sysinfo.Snapshot{CPUBusyPct: -1, OwnBusyPct: -1, Power: sysinfo.Power{BatteryPct: -1},
+		Memory: sysinfo.Memory{Known: true, TotalMB: 16384, FreeMB: 8000}}}
+	h := newHarnessWith(t, 1, allowAll{}, func(c *agent.Config) { c.Probe = probe.get })
+	stopped := false
+	// Memory runs short just after the job exited on its own, before the
+	// agent has reported it.
+	h.agent.SetAfterWait(func() {
+		probe.setFreeMB(300)
+		stopped = h.agent.RelieveMemory()
+	})
+	req := helperRequest(t, "fail", nil)
+	req.Collect = []string{"result.txt"}
+	res, _, _, err := h.run(t, context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stopped {
+		t.Fatal("the guard didn't stop the job, so this tests nothing")
+	}
+	if res.ExitCode != 2 || res.RemoteError != "" {
+		t.Errorf("exit=%d remote error=%q, want the job's own 2 and no error", res.ExitCode, res.RemoteError)
+	}
+	if got, err := os.ReadFile(filepath.Join(h.outDir, "result.txt")); err != nil || string(got) != "partial" {
+		t.Errorf("collected result.txt = %q, %v; want %q", got, err, "partial")
 	}
 }
 

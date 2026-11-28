@@ -92,6 +92,8 @@ type Agent struct {
 
 	hostsMu      sync.RWMutex
 	allowedHosts map[string]bool // empty: any Host header
+
+	afterWait func() // tests only: runs as each job's process has exited
 }
 
 const historySize = 50

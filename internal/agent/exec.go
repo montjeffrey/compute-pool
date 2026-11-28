@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sync/atomic"
 	"time"
 
 	"github.com/montjeffrey/compute-pool/internal/proto"
@@ -72,6 +73,15 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 	cmd.Stdout = fw.Stream(proto.FrameStdout)
 	cmd.Stderr = fw.Stream(proto.FrameStderr)
 	cmd.WaitDelay = 5 * time.Second
+	// exec calls Cancel only if ctx ends while the process still runs, so
+	// killed tells a stop that ended the job from one that came after it
+	// had exited on its own.
+	var killed atomic.Bool
+	kill := cmd.Cancel
+	cmd.Cancel = func() error {
+		killed.Store(true)
+		return kill()
+	}
 
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
@@ -84,6 +94,10 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 		return exitNotStarted, 0, fmt.Errorf("start %s: %w", req.Argv[0], err)
 	}
 	lowerPriority(cmd)
+	// capped covers the job's process and what it starts from now on, not
+	// a child it started in the instant since Start (a shell's command,
+	// say): that one isn't held to the limit, though stopping the job still
+	// ends it (killTree), as does the low-memory guard.
 	peakMemory, capped := trackMemory(cmd, limitMB, func() {
 		a.cfg.Logger.Printf("job %s stopped: it reached its memory limit of %d MB", jobID, limitMB)
 		stopJob(&memoryLimitError{node: a.cfg.NodeName, limitMB: limitMB})
@@ -93,13 +107,16 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 	}
 	a.jobStoppable(jobID, stopJob)
 	err = cmd.Wait()
+	if a.afterWait != nil {
+		a.afterWait()
+	}
 	dur := time.Since(start)
 	reapTree(cmd)
 	// peakMemory returns only after any limit notice has been handled, so
 	// the cause below is settled.
 	peak := peakMemory()
 
-	cause := stopCause(ctx, err)
+	cause := stopCause(ctx, err, killed.Load())
 
 	if errors.Is(cause, context.DeadlineExceeded) {
 		a.mem.observe(peak)
@@ -131,16 +148,22 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 	return code, dur, runErr
 }
 
-// stopCause is why the job's context ended, read once so the checks after
-// it agree, or nil if the job finished on its own. The low-memory guard can
-// still end the context after the job exits; cmd.Wait returns no error only
-// if the job succeeded before anything stopped it, so that job is reported
-// as it ended.
-func stopCause(ctx context.Context, waitErr error) error {
+// stopCause is why the job was stopped, read once so the checks after it
+// agree, or nil if it ended on its own and keeps its own exit status. The
+// guard, a timeout or a cancel can end ctx after the process has exited;
+// only one that killed it (killed) counts. A job that went past its memory
+// limit and then failed counts as stopped either way: the hard cap past
+// the limit refuses its allocations, so that is the likely failure.
+func stopCause(ctx context.Context, waitErr error, killed bool) error {
 	if waitErr == nil {
 		return nil
 	}
-	return context.Cause(ctx)
+	cause := context.Cause(ctx)
+	var over *memoryLimitError
+	if killed || errors.As(cause, &over) {
+		return cause
+	}
+	return nil
 }
 
 // memoryStop reports the exit code and reason if the job was stopped over

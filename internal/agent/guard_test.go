@@ -79,18 +79,27 @@ func TestRelieveMemoryStopsNewestFirst(t *testing.T) {
 	}
 }
 
-func TestStopCauseIgnoresStopAfterSuccess(t *testing.T) {
+func TestStopCause(t *testing.T) {
 	ctx, stop := context.WithCancelCause(context.Background())
 	low := &lowMemoryError{node: "n", freeMB: 100, criticMB: 512}
-	stop(low) // the guard, after the job already succeeded
-	if got := stopCause(ctx, nil); got != nil {
+	stop(low)
+	if got := stopCause(ctx, nil, true); got != nil {
 		t.Errorf("job that succeeded: cause %v, want nil", got)
 	}
-	if got := stopCause(ctx, errors.New("exit status 1")); got != low {
-		t.Errorf("job that failed: cause %v, want the guard's", got)
+	if got := stopCause(ctx, errors.New("exit status 2"), false); got != nil {
+		t.Errorf("job that failed before the guard's stop: cause %v, want nil", got)
 	}
-	if code, err := memoryStop(stopCause(ctx, errors.New("killed"))); code != exitLowMemory || err != low {
-		t.Errorf("memoryStop = %d, %v, want %d and the guard's reason", code, err, exitLowMemory)
+	if got := stopCause(ctx, errors.New("killed"), true); got != low {
+		t.Errorf("job the guard killed: cause %v, want the guard's", got)
+	}
+	ctx, stop = context.WithCancelCause(context.Background())
+	over := &memoryLimitError{node: "n", limitMB: 128}
+	stop(over)
+	if got := stopCause(ctx, errors.New("exit status 2"), false); got != over {
+		t.Errorf("job that failed past its memory limit: cause %v, want the limit", got)
+	}
+	if code, err := memoryStop(over); code != exitLowMemory || err != over {
+		t.Errorf("memoryStop = %d, %v, want %d and the limit", code, err, exitLowMemory)
 	}
 	if code, err := memoryStop(nil); code != 0 || err != nil {
 		t.Errorf("memoryStop(nil) = %d, %v, want 0, nil", code, err)
