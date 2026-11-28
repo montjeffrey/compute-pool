@@ -74,13 +74,21 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 	cmd.Stderr = fw.Stream(proto.FrameStderr)
 	cmd.WaitDelay = 5 * time.Second
 	// exec calls Cancel if ctx ends before it has collected the process's
-	// exit, which can be just after the process exited on its own; how the
-	// process ended (killedByStop) tells the two apart.
-	var canceled atomic.Bool
+	// exit, which can be just after the process exited on its own. The stop
+	// ended the job only if its kill succeeded (killed: on Windows, killing
+	// a process that has already exited fails) and the process ended the
+	// way a kill ends it (killedByStop).
+	var killed atomic.Bool
 	kill := cmd.Cancel
 	cmd.Cancel = func() error {
-		canceled.Store(true)
-		return kill()
+		err := kill()
+		if err == nil {
+			killed.Store(true)
+		}
+		if a.onCancel != nil {
+			a.onCancel(err)
+		}
+		return err
 	}
 
 	start := time.Now()
@@ -98,7 +106,8 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 	// a child it started in the instant since Start (a shell's command,
 	// say): that one isn't held to the limit, though stopping the job still
 	// ends it (killTree), as does the low-memory guard. On Windows the limit
-	// ends the job itself as it passes it, and onLimit gives the reason.
+	// ends the job itself as it passes it, that child included, and onLimit
+	// gives the reason.
 	peakMemory, capped := trackMemory(cmd, limitMB, func() {
 		a.cfg.Logger.Printf("job %s stopped: it reached its memory limit of %d MB", jobID, limitMB)
 		stopJob(&memoryLimitError{node: a.cfg.NodeName, limitMB: limitMB})
@@ -109,7 +118,7 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 	}
 	a.jobStoppable(jobID, stopJob)
 	if a.beforeWait != nil {
-		a.beforeWait()
+		a.beforeWait(cmd.Process.Pid)
 	}
 	err = cmd.Wait()
 	if a.afterWait != nil {
@@ -121,7 +130,7 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 	// the cause below is settled.
 	peak := peakMemory()
 
-	cause := stopCause(ctx, err, canceled.Load() && killedByStop(cmd.ProcessState))
+	cause := stopCause(ctx, err, killed.Load() && killedByStop(cmd.ProcessState))
 	var notSet *limitNotSetError
 	if errors.As(cause, &notSet) {
 		return exitNotStarted, dur, cause
@@ -145,6 +154,9 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 	switch {
 	case errors.As(err, &exitErr):
 		code = exitErr.ExitCode()
+	case cmd.ProcessState != nil && cmd.ProcessState.Success() && errors.Is(err, ctx.Err()):
+		// It exited cleanly before a stop whose kill then found nothing to
+		// end; exec reports that stop instead of the clean exit.
 	case err != nil:
 		code, runErr = 1, err
 	}

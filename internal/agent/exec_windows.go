@@ -53,26 +53,31 @@ const stoppedExitCode = 0x504F4F4C // "POOL"
 // stoppedExitCode. Process.Kill alone would leave grandchildren (compilers,
 // test runners) running. The process itself goes first, so it can't start
 // more; its descendants are found by parent first, as taskkill /T finds
-// them.
+// them, and ended even if it had exited already. It returns
+// os.ErrProcessDone if the process had exited before it could be ended.
 func killTree(cmd *exec.Cmd) error {
 	pid := uint32(cmd.Process.Pid)
 	tree := descendants(pid)
-	if err := terminate(pid); err != nil {
-		return err
-	}
+	err := terminate(pid)
 	for _, p := range tree {
 		_ = terminate(p) // it may have exited already
 	}
-	return nil
+	return err
 }
 
 func terminate(pid uint32) error {
-	h, err := syscall.OpenProcess(syscall.PROCESS_TERMINATE, false, pid)
+	h, err := syscall.OpenProcess(syscall.PROCESS_TERMINATE|syscall.SYNCHRONIZE, false, pid)
 	if err != nil {
 		return err
 	}
 	defer syscall.CloseHandle(h)
-	return syscall.TerminateProcess(h, stoppedExitCode)
+	if err := syscall.TerminateProcess(h, stoppedExitCode); err != nil {
+		if ev, _ := syscall.WaitForSingleObject(h, 0); ev == syscall.WAIT_OBJECT_0 {
+			return os.ErrProcessDone // it exited on its own first
+		}
+		return err
+	}
+	return nil
 }
 
 // descendants lists the processes started by pid, and by those, from a
@@ -126,10 +131,15 @@ const JobMemoryLimitEnforced = true
 
 // trackMemory starts measuring the job's memory and, if limitMB is above
 // zero, ends the job and its children as soon as they commit more than that
-// together, calling onLimit first. capped reports whether the limit was set. The returned function
-// reports the peak in bytes (0 if unknown) once the job has exited. A child
-// the job starts in the instant before tracking begins isn't counted or
-// capped.
+// together, calling onLimit first. capped reports whether the limit was set.
+// The returned function reports the peak in bytes (0 if unknown) once the
+// job has exited. A child the job starts in the instant before tracking
+// begins isn't counted or held to the limit, but the limit still ends it:
+// killTree runs before the job object ends the job's process, while that
+// child can still be found by its parent.
 func trackMemory(cmd *exec.Cmd, limitMB int64, onLimit func()) (peak func() uint64, capped bool) {
-	return sysinfo.TrackMemory(cmd.Process.Pid, uint64(max(0, limitMB))<<20, onLimit)
+	return sysinfo.TrackMemory(cmd.Process.Pid, uint64(max(0, limitMB))<<20, func() {
+		onLimit()
+		_ = killTree(cmd)
+	})
 }

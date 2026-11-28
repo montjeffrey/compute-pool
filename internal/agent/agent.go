@@ -93,8 +93,9 @@ type Agent struct {
 	hostsMu      sync.RWMutex
 	allowedHosts map[string]bool // empty: any Host header
 
-	beforeWait func() // tests only: runs as each job's process has started, before Wait
-	afterWait  func() // tests only: runs as each job's process has exited
+	beforeWait func(pid int)       // tests only: runs as each job's process has started, before Wait
+	afterWait  func()              // tests only: runs as each job's process has exited
+	onCancel   func(killErr error) // tests only: runs as exec stops a job's process, with the kill's result
 }
 
 const historySize = 50
