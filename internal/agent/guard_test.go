@@ -108,30 +108,35 @@ func TestStopCause(t *testing.T) {
 	}
 }
 
-// TestKilledByStop covers a stop that reaches exec after the process has
-// exited but before Wait has returned: Cancel then runs, and only how the
-// process ended shows it ended on its own.
+// TestKilledByStop checks that only a process Cancel ended counts as
+// killed: one that exits by itself with 1, the code taskkill /F leaves on
+// Windows, or 2, doesn't.
 func TestKilledByStop(t *testing.T) {
 	helper := func(mode string) *exec.Cmd {
-		cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$", "--", mode)
+		cmd := buildCommand(context.Background(), proto.RunRequest{Argv: []string{os.Args[0], "-test.run=^TestHelperProcess$", "--", mode}})
 		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
 		return cmd
 	}
-	own := helper("fail") // exits 2 on its own
-	if err := own.Run(); err == nil {
-		t.Fatal("fail helper exited 0")
-	}
-	if killedByStop(own.ProcessState) {
-		t.Errorf("a job that exited 2 itself counts as killed (%v)", own.ProcessState)
+	for _, mode := range []string{"fail", "fail1"} {
+		own := helper(mode)
+		own.Dir = t.TempDir()
+		if err := own.Run(); err == nil {
+			t.Fatalf("%s helper exited 0", mode)
+		}
+		if killedByStop(own.ProcessState) {
+			t.Errorf("a job that exited %d itself counts as killed", own.ProcessState.ExitCode())
+		}
 	}
 	stopped := helper("sleep")
 	if err := stopped.Start(); err != nil {
 		t.Fatal(err)
 	}
-	stopped.Process.Kill()
+	if err := stopped.Cancel(); err != nil {
+		t.Fatal(err)
+	}
 	stopped.Wait()
 	if !killedByStop(stopped.ProcessState) {
-		t.Errorf("a killed job doesn't count as killed (%v)", stopped.ProcessState)
+		t.Errorf("a job Cancel ended doesn't count as killed (%v)", stopped.ProcessState)
 	}
 	if !killedByStop(nil) {
 		t.Error("a job never waited for doesn't count as killed")

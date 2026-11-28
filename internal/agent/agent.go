@@ -49,9 +49,9 @@ type Config struct {
 	// JobMemoryMB is the memory each job is assumed to need until the agent
 	// has measured finished jobs (default DefaultJobMemoryMB).
 	JobMemoryMB int64
-	// JobMemoryLimitMB caps the memory one job, with every process it
-	// starts, can commit; 0 means no cap. Only enforced where
-	// JobMemoryLimitEnforced is true.
+	// JobMemoryLimitMB is the memory one job, with every process it
+	// starts, can commit before it is ended; 0 means no limit. Only
+	// enforced where JobMemoryLimitEnforced is true.
 	JobMemoryLimitMB int64
 
 	// CacheDir keeps shipped files by content hash between jobs; empty
@@ -93,7 +93,8 @@ type Agent struct {
 	hostsMu      sync.RWMutex
 	allowedHosts map[string]bool // empty: any Host header
 
-	afterWait func() // tests only: runs as each job's process has exited
+	beforeWait func() // tests only: runs as each job's process has started, before Wait
+	afterWait  func() // tests only: runs as each job's process has exited
 }
 
 const historySize = 50

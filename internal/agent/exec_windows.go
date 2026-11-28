@@ -6,9 +6,9 @@ import (
 	"context"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"syscall"
+	"unsafe"
 
 	"github.com/montjeffrey/compute-pool/internal/proto"
 	"github.com/montjeffrey/compute-pool/internal/sysinfo"
@@ -44,23 +44,71 @@ func buildCommand(ctx context.Context, req proto.RunRequest) *exec.Cmd {
 	return cmd
 }
 
-// killTree ends the job and every process it started. Process.Kill alone
-// would leave grandchildren (compilers, test runners) running.
+// stoppedExitCode is the exit code killTree gives the processes it ends,
+// so the agent can tell from a job's exit that it ended the job: taskkill
+// /F and Process.Kill leave 1, which programs also exit with themselves.
+const stoppedExitCode = 0x504F4F4C // "POOL"
+
+// killTree ends the job's process and every process it started, with
+// stoppedExitCode. Process.Kill alone would leave grandchildren (compilers,
+// test runners) running. The process itself goes first, so it can't start
+// more; its descendants are found by parent first, as taskkill /T finds
+// them.
 func killTree(cmd *exec.Cmd) error {
-	kill := exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(cmd.Process.Pid))
-	kill.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
-	if err := kill.Run(); err != nil {
-		return cmd.Process.Kill()
+	pid := uint32(cmd.Process.Pid)
+	tree := descendants(pid)
+	if err := terminate(pid); err != nil {
+		return err
+	}
+	for _, p := range tree {
+		_ = terminate(p) // it may have exited already
 	}
 	return nil
 }
 
+func terminate(pid uint32) error {
+	h, err := syscall.OpenProcess(syscall.PROCESS_TERMINATE, false, pid)
+	if err != nil {
+		return err
+	}
+	defer syscall.CloseHandle(h)
+	return syscall.TerminateProcess(h, stoppedExitCode)
+}
+
+// descendants lists the processes started by pid, and by those, from a
+// snapshot of the processes running now; nil if there is none.
+func descendants(pid uint32) []uint32 {
+	snap, err := syscall.CreateToolhelp32Snapshot(syscall.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return nil
+	}
+	defer syscall.CloseHandle(snap)
+	children := map[uint32][]uint32{}
+	e := syscall.ProcessEntry32{Size: uint32(unsafe.Sizeof(syscall.ProcessEntry32{}))}
+	for err := syscall.Process32First(snap, &e); err == nil; err = syscall.Process32Next(snap, &e) {
+		if e.ProcessID != e.ParentProcessID { // the idle process is its own parent
+			children[e.ParentProcessID] = append(children[e.ParentProcessID], e.ProcessID)
+		}
+	}
+	var tree []uint32
+	seen := map[uint32]bool{pid: true}
+	for queue := []uint32{pid}; len(queue) > 0; queue = queue[1:] {
+		for _, c := range children[queue[0]] {
+			if !seen[c] {
+				seen[c] = true
+				tree = append(tree, c)
+				queue = append(queue, c)
+			}
+		}
+	}
+	return tree
+}
+
 // killedByStop reports whether the job's process ended the way Cancel ends
-// it: taskkill /F and Process.Kill both leave exit code 1. A program that
-// exits with 1 itself just as a stop lands can't be told apart, and counts
-// as stopped. A process never waited for (state nil) counts as killed.
+// it (killTree, with stoppedExitCode), not by exiting on its own. A process
+// never waited for (state nil) counts as killed.
 func killedByStop(state *os.ProcessState) bool {
-	return state == nil || state.ExitCode() == 1
+	return state == nil || state.ExitCode() == stoppedExitCode
 }
 
 // reapTree is a no-op on Windows: once the main process has exited its

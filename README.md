@@ -217,8 +217,10 @@ starts paging and can stop responding altogether:
 
 - **Each job has a memory limit** (`--job-memory-limit`, default a third of
   the device's memory, at least 1 GB): the job and everything it starts are
-  ended as soon as they commit more, with exit code 137 and the reason. A
-  device that can't set the limit doesn't run the job. Enforced on Windows;
+  ended as soon as they commit more, with exit code 137 and the reason. They
+  aren't refused memory first, because a program refused memory can hang for
+  good, so a job that allocates a lot at once commits it for the moment
+  before it ends. A device that can't set the limit doesn't run the job. Enforced on Windows;
   Linux and macOS don't enforce it yet.
 - **Running jobs are stopped when free memory gets critically low**: below
   half the reserve kept for you (the larger of 512 MB and a twentieth of

@@ -55,7 +55,7 @@ func newAgentFlags(name string, stderr io.Writer) (*flag.FlagSet, *agentFlags) {
 		busyThreshold: fs.Float64("busy-threshold", 80, "refuse new jobs while CPU use is at or above this percent (0 = never)"),
 		cacheMB:       fs.Int64("cache-mb", 2048, "disk space for caching shipped files between jobs (0 = no cache)"),
 		jobMemory:     fs.Int64("job-memory", agent.DefaultJobMemoryMB, "memory in MB to assume each job needs until jobs have been measured"),
-		jobMemLimit:   fs.Int64("job-memory-limit", -1, "most memory in MB one job, with everything it starts, may use (-1 = a third of this device's memory, 0 = no limit; enforced on Windows)"),
+		jobMemLimit:   fs.Int64("job-memory-limit", -1, "memory in MB past which a job, with everything it starts, is ended (-1 = a third of this device's memory, 0 = no limit; enforced on Windows)"),
 		logFile:       fs.String("log-file", "", "append the agent's log to this file instead of stderr"),
 		hideConsole:   fs.Bool("hide-console", false, "detach from the console window (used by the startup task)"),
 	}

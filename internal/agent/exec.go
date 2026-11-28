@@ -108,6 +108,9 @@ func (a *Agent) execute(ctx context.Context, jobID string, req proto.RunRequest,
 		stopJob(&limitNotSetError{node: a.cfg.NodeName, limitMB: limitMB})
 	}
 	a.jobStoppable(jobID, stopJob)
+	if a.beforeWait != nil {
+		a.beforeWait()
+	}
 	err = cmd.Wait()
 	if a.afterWait != nil {
 		a.afterWait()
